@@ -1,0 +1,561 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Phase 0: SmartRoute Foundation Infrastructure - S3, DynamoDB, IAM, VPC'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: smartroute
+    Description: Project name for resource naming
+
+  AccountId:
+    Type: String
+    Description: AWS Account ID (12 digits)
+
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Number of days to retain raw data in S3 before archiving
+
+  ArchiveRetentionDays:
+    Type: Number
+    Default: 365
+    Description: Number of days to retain archived data before deletion
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - AccountId
+      - Label:
+          default: "Data Retention"
+        Parameters:
+          - DataRetentionDays
+          - ArchiveRetentionDays
+
+Resources:
+  # ==================== S3 Data Lake Buckets ====================
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-lake-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DataLakeBucketLifecycle:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-lake-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          # Move raw data to STANDARD_IA after 30 days
+          - Id: ArchiveRawData
+            Prefix: raw/
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref DataRetentionDays
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: !Ref ArchiveRetentionDays
+          # Keep processed data longer (warm storage)
+          - Id: ArchiveProcessedData
+            Prefix: processed/
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 60
+                StorageClass: STANDARD_IA
+            ExpirationInDays: !Ref ArchiveRetentionDays
+          # Clean up logs after 90 days
+          - Id: CleanupLogs
+            Prefix: logs/
+            Status: Enabled
+            ExpirationInDays: 90
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-config-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==================== DynamoDB Tables ====================
+
+  StationRealtimeStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}_station_realtime_state'
+      BillingMode: PAY_PER_REQUEST  # On-demand for free tier
+      AttributeDefinitions:
+        - AttributeName: station_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: station_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiration_time
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: RealTimeState
+
+  CachedRoutesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}_cached_routes'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: route_hash
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: route_hash
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiration_time
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: RouteCache
+
+  UserSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}_user_sessions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: session_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: UserSessions
+
+  # ==================== IAM Roles ====================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${DataLakeBucket.Arn}/*'
+                  - !Sub '${LogsBucket.Arn}/*'
+                  - !Sub '${ConfigBucket.Arn}/*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt StationRealtimeStateTable.Arn
+                  - !GetAtt CachedRoutesTable.Arn
+                  - !GetAtt UserSessionsTable.Arn
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListStreams
+                  - kinesis:ListShards
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: '*'
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::model/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataLakeBucket.Arn}'
+                  - !Sub '${DataLakeBucket.Arn}/*'
+                  - !Sub '${LogsBucket.Arn}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==================== CloudWatch Log Groups ====================
+
+  MtaPollerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}/mta-poller'
+      RetentionInDays: 14
+
+  RouteHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}/route-handler'
+      RetentionInDays: 14
+
+  EnrichmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}/enrichment'
+      RetentionInDays: 14
+
+  BedrockRouterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}/bedrock-router'
+      RetentionInDays: 14
+
+  # ==================== Secrets Manager ====================
+
+  ApiKeysSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/api-keys'
+      Description: API keys for MTA, Google Maps, and other services
+      SecretString: |
+        {
+          "mta_api_key": "PLACEHOLDER_MTA_KEY",
+          "google_maps_api_key": "PLACEHOLDER_GOOGLE_KEY"
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==================== EventBridge Rules ====================
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}*'
+
+  # ==================== SNS Topics for Alarms ====================
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms'
+      DisplayName: SmartRoute Alarms
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==================== CloudWatch Alarms ====================
+
+  S3BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-s3-bucket-size'
+      AlarmDescription: Alert when S3 data lake exceeds 100GB
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400  # 1 day
+      EvaluationPeriods: 1
+      Threshold: 107374182400  # 100GB in bytes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref DataLakeBucket
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dynamodb-throttle'
+      AlarmDescription: Alert on DynamoDB throttling
+      MetricName: ConsumedWriteCapacityUnits
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref StationRealtimeStateTable
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ==================== CloudWatch Dashboard ====================
+
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-phase0-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", { "stat": "Average" } ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", { "stat": "Sum" } ],
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", { "stat": "Sum" } ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage and Database Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "fields @timestamp, @message | stats count() by @message | sort @timestamp desc",
+                "region": "${AWS::Region}",
+                "title": "Recent Logs"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DataLakeBucketName:
+    Description: S3 Data Lake Bucket Name
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${ProjectName}-data-lake-bucket'
+
+  DataLakeBucketArn:
+    Description: S3 Data Lake Bucket ARN
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-data-lake-arn'
+
+  LogsBucketName:
+    Description: S3 Logs Bucket Name
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${ProjectName}-logs-bucket'
+
+  ConfigBucketName:
+    Description: S3 Config Bucket Name
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${ProjectName}-config-bucket'
+
+  StationRealtimeStateTableName:
+    Description: DynamoDB Station Realtime State Table
+    Value: !Ref StationRealtimeStateTable
+    Export:
+      Name: !Sub '${ProjectName}-station-state-table'
+
+  CachedRoutesTableName:
+    Description: DynamoDB Cached Routes Table
+    Value: !Ref CachedRoutesTable
+    Export:
+      Name: !Sub '${ProjectName}-cached-routes-table'
+
+  UserSessionsTableName:
+    Description: DynamoDB User Sessions Table
+    Value: !Ref UserSessionsTable
+    Export:
+      Name: !Sub '${ProjectName}-user-sessions-table'
+
+  LambdaExecutionRoleArn:
+    Description: Lambda Execution Role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-role-arn'
+
+  GlueExecutionRoleArn:
+    Description: Glue Execution Role ARN
+    Value: !GetAtt GlueExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-glue-role-arn'
+
+  EventBridgeRoleArn:
+    Description: EventBridge Role ARN
+    Value: !GetAtt EventBridgeRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-eventbridge-role-arn'
+
+  ApiKeysSecretArn:
+    Description: Secrets Manager Secret ARN for API Keys
+    Value: !Ref ApiKeysSecret
+    Export:
+      Name: !Sub '${ProjectName}-api-keys-secret'
+
+  AlarmTopicArn:
+    Description: SNS Topic for Alarms
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub '${ProjectName}-alarm-topic-arn'
