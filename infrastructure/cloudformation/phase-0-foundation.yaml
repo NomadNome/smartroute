@@ -63,16 +63,6 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref Environment
-
-  DataLakeBucketLifecycle:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub '${ProjectName}-data-lake-${AWS::AccountId}'
       LifecycleConfiguration:
         Rules:
           # Move raw data to STANDARD_IA after 30 days
@@ -98,6 +88,11 @@ Resources:
             Prefix: logs/
             Status: Enabled
             ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
 
   LogsBucket:
     Type: AWS::S3::Bucket
