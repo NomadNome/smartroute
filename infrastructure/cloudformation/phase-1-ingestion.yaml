@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Phase 1: SmartRoute Real-Time Data Ingestion - Lambda, Kinesis, EventBridge'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: smartroute
+    Description: Project name
+
+  Environment:
+    Type: String
+    Default: development
+    Description: Environment (development/staging/production)
+
+  LambdaMemory:
+    Type: Number
+    Default: 512
+    Description: Lambda function memory in MB
+
+  KinesisShards:
+    Type: Number
+    Default: 1
+    Description: Number of Kinesis shards
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - LambdaMemory
+          - KinesisShards
+
+Resources:
+  # ==================== Kinesis Stream ====================
+
+  TransitDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}_transit_data_stream'
+      ShardCount: !Ref KinesisShards
+      RetentionPeriod: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==================== MTA Poller Lambda ====================
+
+  MtaPollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-mta-poller'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-lambda-execution-role'
+      Timeout: 60
+      MemorySize: !Ref LambdaMemory
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code during deployment
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'message': 'Placeholder'}
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          S3_BUCKET: !Sub '${ProjectName}-data-lake-${AWS::AccountId}'
+          KINESIS_STREAM_NAME: !GetAtt TransitDataStream.Arn
+          DYNAMODB_TABLE: !Sub '${ProjectName}_station_realtime_state'
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '1'
+
+  # ==================== Real-Time Processor Lambda ====================
+
+  RealtimeProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-realtime-processor'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-lambda-execution-role'
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'message': 'Placeholder'}
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Sub '${ProjectName}_station_realtime_state'
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '1'
+
+  # ==================== Event Source Mapping (Kinesis → Lambda) ====================
+
+  RealtimeProcessorEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TransitDataStream.Arn
+      FunctionName: !GetAtt RealtimeProcessorFunction.Arn
+      Enabled: true
+      BatchSize: 100
+      StartingPosition: LATEST
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 10
+      MaximumRetryAttempts: 2
+      BisectBatchOnFunctionError: true
+
+  # ==================== EventBridge Rules ====================
+
+  MtaPollerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-mta-poller-schedule'
+      Description: Trigger MTA poller every 30 seconds
+      ScheduleExpression: 'rate(30 seconds)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MtaPollerFunction.Arn
+          RoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-eventbridge-role'
+          RetryPolicy:
+            MaximumEventAge: 60
+            MaximumRetryAttempts: 2
+
+  MtaPollerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MtaPollerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MtaPollerScheduleRule.Arn
+
+  # ==================== CloudWatch Alarms ====================
+
+  MtaPollerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-mta-poller-errors'
+      AlarmDescription: Alert on MTA poller Lambda errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MtaPollerFunction
+      AlarmActions:
+        - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-alarms'
+      TreatMissingData: notBreaching
+
+  MtaPollerDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-mta-poller-duration'
+      AlarmDescription: Alert if MTA poller takes too long
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 40000  # 40 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MtaPollerFunction
+      AlarmActions:
+        - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-alarms'
+
+  KinesisIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-kinesis-iterator-age'
+      AlarmDescription: Alert if Kinesis iterator age is too high
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 60000  # 1 minute
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref TransitDataStream
+      AlarmActions:
+        - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-alarms'
+
+  # ==================== CloudWatch Dashboards ====================
+
+  Phase1Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-phase1-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", { "stat": "Sum" }, { "label": "Invocations" } ],
+                  [ ".", "Errors", { "stat": "Sum" }, { "label": "Errors" } ],
+                  [ ".", "Duration", { "stat": "Average" }, { "label": "Duration (ms)" } ],
+                  [ ".", "ConcurrentExecutions", { "stat": "Maximum" }, { "label": "Concurrent" } ]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "MTA Poller Lambda Metrics",
+                "dimensions": {
+                  "FunctionName": "${MtaPollerFunction}"
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", { "stat": "Maximum" } ],
+                  [ ".", "GetRecords.LatencyPerRecord", { "stat": "Average" } ],
+                  [ ".", "GetRecords.Records", { "stat": "Sum" } ]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Kinesis Stream Metrics",
+                "dimensions": {
+                  "StreamName": "${TransitDataStream}"
+                }
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "fields @timestamp, @message, @logStream | filter @message like /ERROR/ | stats count() by @logStream",
+                "region": "${AWS::Region}",
+                "title": "Errors by Component"
+              }
+            }
+          ]
+        }
+
+  # ==================== Log Retention ====================
+
+  MtaPollerLogRetention:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-mta-poller'
+      RetentionInDays: 14
+
+  RealtimeProcessorLogRetention:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-realtime-processor'
+      RetentionInDays: 14
+
+Outputs:
+  TransitDataStreamArn:
+    Description: Kinesis Stream ARN
+    Value: !GetAtt TransitDataStream.Arn
+    Export:
+      Name: !Sub '${ProjectName}-kinesis-stream-arn'
+
+  TransitDataStreamName:
+    Description: Kinesis Stream Name
+    Value: !Ref TransitDataStream
+    Export:
+      Name: !Sub '${ProjectName}-kinesis-stream-name'
+
+  MtaPollerFunctionArn:
+    Description: MTA Poller Lambda ARN
+    Value: !GetAtt MtaPollerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-mta-poller-arn'
+
+  MtaPollerFunctionName:
+    Description: MTA Poller Lambda Name
+    Value: !Ref MtaPollerFunction
+    Export:
+      Name: !Sub '${ProjectName}-mta-poller-name'
+
+  RealtimeProcessorFunctionArn:
+    Description: Real-time Processor Lambda ARN
+    Value: !GetAtt RealtimeProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-realtime-processor-arn'
+
+  RealtimeProcessorFunctionName:
+    Description: Real-time Processor Lambda Name
+    Value: !Ref RealtimeProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-realtime-processor-name'
