@@ -1,0 +1,1 @@
+{"statusCode": 200, "timestamp": "2025-10-30T15:02:39.070784+00:00", "records_processed": 5, "alerts_processed": 0, "s3_writes": 1, "kinesis_records": 5, "dynamodb_updates": 5}

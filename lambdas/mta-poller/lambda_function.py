@@ -1,28 +1,31 @@
 """
-SmartRoute MTA GTFS-RT Data Poller
+SmartRoute MTA GTFS-RT Data Poller - REAL IMPLEMENTATION
 
-Polls the MTA real-time transit API every 30 seconds and streams
-vehicle positions, arrival predictions, and service alerts to:
-- S3 (for archival)
-- Kinesis (for real-time processing)
-- DynamoDB (for current state)
+Polls the MTA real-time transit API using actual GTFS-RT protobuf decoding.
+Extracts real vehicle positions, stop IDs, and arrival predictions from live MTA data.
+
+Streams to:
+- S3 (raw protobuf + parsed JSON with date/hour partitioning)
+- Kinesis (real-time vehicle updates)
+- DynamoDB (current station arrival state)
 """
 
 import json
 import boto3
 import requests
 import os
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
 import logging
-from aws_lambda_powertools import Logger, Tracer, Metrics
-from aws_lambda_powertools.utilities.typing import LambdaContext
-from aws_lambda_powertools.utilities.data_classes.kinesis_stream_event import KinesisStreamRecord
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
+import base64
+from urllib.parse import quote
 
-# Initialize AWS Lambda Powertools
-logger = Logger()
-tracer = Tracer()
-metrics = Metrics()
+# GTFS-RT imports
+from google.transit import gtfs_realtime_pb2
+
+# Setup logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Initialize AWS SDK clients
 s3_client = boto3.client('s3')
@@ -32,27 +35,34 @@ secretsmanager_client = boto3.client('secretsmanager')
 
 # Environment variables
 S3_BUCKET = os.environ.get('S3_BUCKET', 'smartroute-data-lake-069899605581')
-KINESIS_STREAM = os.environ.get('KINESIS_STREAM_NAME', 'transit_data_stream')
+KINESIS_STREAM_NAME = 'smartroute_transit_data_stream'
 DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', 'smartroute_station_realtime_state')
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
-MTA_API_BASE = 'http://datamine.mta.info/mta_esi.php'
 
-# Configuration
+# MTA Configuration - PUBLIC GTFS-RT FEEDS (NO API KEY REQUIRED)
+# These feeds are publicly accessible from the MTA
 MTA_FEEDS = {
-    '1': 'subway',      # 1 = Subway (we care about this)
-    '2': 'bus',         # 2 = Bus (optional)
-    '3': 'lirr'         # 3 = LIRR/Metro-North (optional)
+    'nyct/gtfs': 'Lines 1/2/3/4/5',
+    'nyct/gtfs-nqrw': 'Lines N/Q/R/W',
+    'nyct/gtfs-ace': 'Lines A/C/E',
+    'nyct/gtfs-bdfm': 'Lines B/D/F/M',
+    'nyct/gtfs-g': 'Line G',
+    'nyct/gtfs-jz': 'Lines J/Z',
+    'nyct/gtfs-l': 'Line L',
+    'nyct/gtfs-si': 'Staten Island Railway'
 }
+MTA_API_BASE = 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds'
 
-# Set logger level
-logger.setLevel(LOG_LEVEL)
+# Set log level properly
+log_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logger.setLevel(log_level)
 
-@logger.inject_lambda_context
-@tracer.capture_lambda_handler
-@metrics.log_cold_start_metric
-def lambda_handler(event: Dict, context: LambdaContext) -> Dict:
+
+def lambda_handler(event: Dict, context) -> Dict:
     """
-    Main Lambda handler - triggered by EventBridge every 30 seconds
+    Main Lambda handler - triggered by EventBridge every 1 minute
+
+    Fetches real GTFS-RT data from MTA, decodes protobuf, streams to multiple destinations.
 
     Args:
         event: EventBridge event
@@ -62,360 +72,293 @@ def lambda_handler(event: Dict, context: LambdaContext) -> Dict:
         Summary of processing results
     """
 
-    logger.info(f"Starting MTA data poll at {datetime.now(timezone.utc).isoformat()}")
-
     try:
-        # Get API key from Secrets Manager
-        mta_api_key = get_secret('smartroute/api-keys')['mta_api_key']
+        logger.info(f"Starting real MTA data poll at {datetime.now(timezone.utc).isoformat()}")
 
-        # Fetch data from MTA (we'll start with feed_id=1 for subway)
-        mta_data = fetch_mta_data(mta_api_key, feed_id='1')
+        # Fetch and process data from all MTA subway feeds (PUBLIC - NO API KEY REQUIRED)
+        all_vehicles = []
+        all_alerts = []
+        total_bytes = 0
 
-        if not mta_data:
-            logger.warning("No data received from MTA API")
-            metrics.add_metric(name="NoDataReceived", unit="Count", value=1)
-            return {
-                'statusCode': 200,
-                'message': 'No data received from MTA API'
-            }
+        for feed_path, feed_name in MTA_FEEDS.items():
+            try:
+                logger.info(f"Fetching feed: {feed_path} ({feed_name})")
 
-        # Parse the raw response
-        vehicle_records, alerts = parse_mta_response(mta_data)
+                # Fetch protobuf from MTA - PUBLIC FEEDS
+                vehicles, alerts, raw_bytes = fetch_and_decode_mta_feed(
+                    feed_path, feed_name
+                )
 
-        logger.info(f"Parsed {len(vehicle_records)} vehicle records and {len(alerts)} alerts")
-        metrics.add_metric(name="VehicleRecordsParsed", unit="Count", value=len(vehicle_records))
-        metrics.add_metric(name="AlertsParsed", unit="Count", value=len(alerts))
+                all_vehicles.extend(vehicles)
+                all_alerts.extend(alerts)
+                total_bytes += raw_bytes
 
-        # Write to all three destinations in parallel
-        s3_result = write_to_s3(vehicle_records, alerts)
-        kinesis_result = write_to_kinesis(vehicle_records, alerts)
-        dynamodb_result = update_dynamodb(vehicle_records)
+                logger.info(f"Feed {feed_path}: {len(vehicles)} vehicles, {len(alerts)} alerts")
 
-        # Compile results
+            except Exception as e:
+                logger.error(f"Error processing feed {feed_path}: {str(e)}")
+                continue
+
+        logger.info(f"Total: {len(all_vehicles)} vehicles, {len(all_alerts)} alerts, {total_bytes} bytes")
+
+        # Write to all three destinations
+        s3_result = write_to_s3(all_vehicles, all_alerts)
+        kinesis_result = write_to_kinesis(all_vehicles, all_alerts)
+        dynamodb_result = update_dynamodb(all_vehicles)
+
         result = {
             'statusCode': 200,
             'timestamp': datetime.now(timezone.utc).isoformat(),
-            'records_processed': len(vehicle_records),
-            'alerts_processed': len(alerts),
-            's3_writes': s3_result,
-            'kinesis_records': kinesis_result,
-            'dynamodb_updates': dynamodb_result,
-            'message': 'MTA data successfully processed'
+            'vehicles_processed': len(all_vehicles),
+            'alerts_processed': len(all_alerts),
+            'total_bytes': total_bytes,
+            's3_writes': s3_result.get('count', 0),
+            'kinesis_records': kinesis_result.get('count', 0),
+            'dynamodb_updates': dynamodb_result.get('count', 0)
         }
 
         logger.info(f"Processing complete: {result}")
-        metrics.add_metric(name="ProcessingSuccess", unit="Count", value=1)
-
         return result
 
     except Exception as e:
-        logger.exception(f"Error processing MTA data: {str(e)}")
-        metrics.add_metric(name="ProcessingError", unit="Count", value=1)
-
-        # Still return 200 so EventBridge doesn't retry
-        # The error is logged for investigation
+        logger.error(f"Critical error in lambda handler: {str(e)}", exc_info=True)
         return {
-            'statusCode': 200,
-            'message': f'Error processing data (logged): {str(e)}',
-            'error': str(e)
+            'statusCode': 500,
+            'error': str(e),
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
 
-def get_secret(secret_name: str) -> Dict:
+def fetch_and_decode_mta_feed(
+    feed_path: str,
+    feed_name: str
+) -> Tuple[List[Dict], List[Dict], int]:
     """
-    Retrieve secret from AWS Secrets Manager
+    Fetch GTFS-RT protobuf from MTA public feeds and decode into vehicle/alert data
 
     Args:
-        secret_name: Name of the secret
+        feed_path: Feed path (e.g., 'nyct/gtfs', 'nyct/gtfs-ace')
+        feed_name: Human-readable feed name
 
     Returns:
-        Dictionary with secret key-value pairs
+        Tuple of (vehicles, alerts, byte_count)
     """
+
     try:
-        response = secretsmanager_client.get_secret_value(SecretId=secret_name)
-        return json.loads(response['SecretString'])
+        # Fetch protobuf from MTA API - PUBLIC FEEDS, NO API KEY REQUIRED
+        # URL-encode the feed path (MTA requires %2F for forward slashes)
+        encoded_feed = quote(feed_path, safe='')
+        url = f"{MTA_API_BASE}/{encoded_feed}"
+
+        logger.info(f"Requesting URL: {url}")
+
+        # Add headers that browsers send (MTA may require these)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/octet-stream',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        raw_bytes = len(response.content)
+        logger.debug(f"Received {raw_bytes} bytes from feed {feed_path}")
+
+        # Decode protobuf
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(response.content)
+
+        vehicles = []
+        alerts = []
+
+        # Extract trip updates (arrival predictions)
+        for entity in feed.entity:
+            if entity.HasField('trip_update'):
+                trip = entity.trip_update
+                route_id = trip.trip.route_id if trip.trip.route_id else 'unknown'
+
+                # Process stop time updates (arrivals/departures)
+                for stop_time in trip.stop_time_update:
+                    stop_id = stop_time.stop_id
+
+                    # Get arrival time
+                    arrival_time = None
+                    arrival_delay = 0
+                    if stop_time.HasField('arrival'):
+                        arrival_time = stop_time.arrival.time
+                        arrival_delay = stop_time.arrival.delay if hasattr(stop_time.arrival, 'delay') else 0
+
+                    vehicle_record = {
+                        'trip_id': trip.trip.trip_id,
+                        'route_id': route_id,
+                        'current_stop': stop_id,
+                        'arrival_time': arrival_time,
+                        'arrival_delay_seconds': arrival_delay,
+                        'next_arrival_seconds': max(0, int((arrival_time - datetime.now(timezone.utc).timestamp()) if arrival_time else 0)),
+                        'headsign': trip.trip.trip_headsign if trip.trip.trip_headsign else 'Unknown',
+                        'vehicle_id': trip.vehicle.id if trip.HasField('vehicle') and trip.vehicle.HasField('id') else 'unknown',
+                        'timestamp': int(datetime.now(timezone.utc).timestamp()),
+                        'feed_path': feed_path
+                    }
+                    vehicles.append(vehicle_record)
+
+            # Extract service alerts
+            if entity.HasField('alert'):
+                alert_entity = entity.alert
+                alert_record = {
+                    'id': entity.id,
+                    'header': alert_entity.header_text.translation[0].text if alert_entity.header_text.translation else 'Alert',
+                    'description': alert_entity.description_text.translation[0].text if alert_entity.description_text.translation else '',
+                    'severity': alert_entity.cause if hasattr(alert_entity, 'cause') else 'UNKNOWN_CAUSE',
+                    'timestamp': int(datetime.now(timezone.utc).timestamp()),
+                    'feed_path': feed_path
+                }
+                alerts.append(alert_record)
+
+        logger.info(f"Decoded {len(vehicles)} vehicles, {len(alerts)} alerts from feed {feed_path}")
+        return vehicles, alerts, raw_bytes
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"HTTP error fetching feed {feed_path}: {str(e)}")
+        raise
     except Exception as e:
-        logger.error(f"Failed to get secret {secret_name}: {str(e)}")
+        logger.error(f"Error decoding feed {feed_path}: {str(e)}")
         raise
 
 
-def fetch_mta_data(api_key: str, feed_id: str = '1') -> Optional[bytes]:
-    """
-    Fetch real-time data from MTA GTFS-RT API
+def write_to_s3(vehicle_records: List[Dict], alerts: List[Dict]) -> Dict:
+    """Write raw and parsed data to S3 with date/hour partitioning"""
 
-    Args:
-        api_key: MTA API key
-        feed_id: Feed ID (1=Subway, 2=Bus, 3=LIRR)
-
-    Returns:
-        Raw protobuf response bytes or None if error
-    """
-    try:
-        params = {
-            'key': api_key,
-            'feed_id': feed_id
-        }
-
-        logger.info(f"Fetching MTA feed {feed_id}")
-
-        response = requests.get(
-            MTA_API_BASE,
-            params=params,
-            timeout=30
-        )
-
-        if response.status_code == 200:
-            metrics.add_metric(name="MTA_API_Success", unit="Count", value=1)
-            return response.content
-        else:
-            logger.error(f"MTA API returned status {response.status_code}")
-            metrics.add_metric(name="MTA_API_Error", unit="Count", value=1)
-            return None
-
-    except requests.Timeout:
-        logger.error("MTA API request timeout")
-        metrics.add_metric(name="MTA_API_Timeout", unit="Count", value=1)
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching MTA data: {str(e)}")
-        metrics.add_metric(name="MTA_API_Exception", unit="Count", value=1)
-        return None
-
-
-def parse_mta_response(data: bytes) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Parse protobuf GTFS-RT response into vehicle records and alerts
-
-    NOTE: This is a placeholder. Full protobuf parsing requires:
-    1. Download GTFS-RT protobuf descriptor from MTA
-    2. Compile with protoc
-    3. Use generated Python classes
-
-    For now, returns empty lists. Full implementation in next commit.
-
-    Args:
-        data: Raw protobuf bytes from MTA API
-
-    Returns:
-        Tuple of (vehicle_records, alerts)
-    """
-    try:
-        # TODO: Implement actual protobuf parsing
-        # This requires:
-        # - google.protobuf library
-        # - gtfs-realtime-bindings Python package
-        # - MTA GTFS-RT descriptor file
-
-        logger.warning("Protobuf parsing not yet implemented - returning empty data")
-
-        # For now, return sample structure for testing pipeline
-        sample_vehicle = {
-            'source': 'mta-poller',
-            'feed_id': '1',
-            'timestamp': int(datetime.now(timezone.utc).timestamp()),
-            'trip_id': 'SAMPLE_TRIP',
-            'vehicle_id': 'SAMPLE_VEH',
-            'route_id': '1',
-            'current_stop': 'S127N',
-            'status': 'IN_TRANSIT_TO',
-            'latitude': 40.8207,
-            'longitude': -73.9654,
-            'next_arrival_seconds': 180,
-            'crowding_estimate': None
-        }
-
-        vehicle_records = [sample_vehicle]
-        alerts = []
-
-        return vehicle_records, alerts
-
-    except Exception as e:
-        logger.error(f"Error parsing MTA response: {str(e)}")
-        metrics.add_metric(name="ParseError", unit="Count", value=1)
-        return [], []
-
-
-def write_to_s3(vehicles: List[Dict], alerts: List[Dict]) -> int:
-    """
-    Write raw data to S3 data lake with date/hour partitioning
-
-    Args:
-        vehicles: List of vehicle records
-        alerts: List of alert records
-
-    Returns:
-        Number of records written
-    """
     try:
         now = datetime.now(timezone.utc)
+        partition = f"raw/mta/realtime/year={now.year}/month={now.month:02d}/day={now.day:02d}/hour={now.hour:02d}"
 
-        # Build partitioned path: raw/mta/realtime/year=YYYY/month=MM/day=DD/hour=HH/
-        partition_path = (
-            f"raw/mta/realtime/"
-            f"year={now.year:04d}/"
-            f"month={now.month:02d}/"
-            f"day={now.day:02d}/"
-            f"hour={now.hour:02d}/"
-        )
+        # Write parsed JSON
+        timestamp_iso = now.isoformat()
+        json_key = f"{partition}/vehicles-{timestamp_iso}.json"
 
-        filename = f"mta_realtime_{now.strftime('%Y%m%d_%H%M%S')}.jsonl"
-        s3_key = partition_path + filename
-
-        # Combine vehicle and alert data
-        all_records = vehicles + alerts
-
-        if not all_records:
-            logger.warning("No records to write to S3")
-            return 0
-
-        # Write as JSON Lines (one JSON object per line)
-        content = '\n'.join(json.dumps(record) for record in all_records)
-
-        logger.info(f"Writing {len(all_records)} records to S3: s3://{S3_BUCKET}/{s3_key}")
+        data = {
+            'timestamp': timestamp_iso,
+            'vehicle_records': vehicle_records,
+            'alerts': alerts,
+            'metadata': {
+                'total_vehicles': len(vehicle_records),
+                'total_alerts': len(alerts),
+                'partition': partition
+            }
+        }
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=content.encode('utf-8'),
-            ContentType='application/x-ndjson',
-            ServerSideEncryption='AES256'
+            Key=json_key,
+            Body=json.dumps(data, default=str),
+            ContentType='application/json'
         )
 
-        metrics.add_metric(name="S3_RecordsWritten", unit="Count", value=len(all_records))
-        logger.info(f"Successfully wrote {len(all_records)} records to S3")
-
-        return len(all_records)
+        logger.info(f"✓ Wrote to S3: {json_key} ({len(vehicle_records)} vehicles)")
+        return {'count': 1, 'key': json_key, 'records': len(vehicle_records)}
 
     except Exception as e:
-        logger.error(f"Error writing to S3: {str(e)}")
-        metrics.add_metric(name="S3_WriteError", unit="Count", value=1)
-        return 0
+        logger.error(f"Error writing to S3: {str(e)}", exc_info=True)
+        return {'count': 0, 'error': str(e)}
 
 
-def write_to_kinesis(vehicles: List[Dict], alerts: List[Dict]) -> int:
-    """
-    Write records to Kinesis stream for real-time processing
+def write_to_kinesis(vehicle_records: List[Dict], alerts: List[Dict]) -> Dict:
+    """Stream vehicle records to Kinesis for real-time processing"""
 
-    Args:
-        vehicles: List of vehicle records
-        alerts: List of alert records
-
-    Returns:
-        Number of records written
-    """
     try:
-        all_records = vehicles + alerts
+        count = 0
 
-        if not all_records:
-            logger.warning("No records to write to Kinesis")
-            return 0
-
-        logger.info(f"Writing {len(all_records)} records to Kinesis stream: {KINESIS_STREAM}")
-
-        # Write each record as separate Kinesis record
-        # Using trip_id as partition key for ordering
-        failed_records = []
-
-        for record in all_records:
+        # Put each vehicle record to Kinesis
+        for record in vehicle_records:
             try:
-                partition_key = record.get('trip_id', 'DEFAULT')
-
                 kinesis_client.put_record(
-                    StreamName=KINESIS_STREAM,
-                    Data=json.dumps(record),
-                    PartitionKey=partition_key
+                    StreamName='smartroute_transit_data_stream',
+                    Data=json.dumps(record, default=str),
+                    PartitionKey=record.get('route_id', 'default')
                 )
+                count += 1
             except Exception as e:
-                logger.error(f"Failed to write record to Kinesis: {str(e)}")
-                failed_records.append(record)
+                logger.error(f"Error putting record to Kinesis: {str(e)}")
+                continue
 
-        successful = len(all_records) - len(failed_records)
-        metrics.add_metric(name="Kinesis_RecordsWritten", unit="Count", value=successful)
-
-        if failed_records:
-            logger.warning(f"{len(failed_records)} records failed to write to Kinesis")
-            metrics.add_metric(name="Kinesis_WriteError", unit="Count", value=len(failed_records))
-
-        logger.info(f"Successfully wrote {successful} records to Kinesis")
-
-        return successful
+        logger.info(f"✓ Wrote {count} records to Kinesis")
+        return {'count': count}
 
     except Exception as e:
-        logger.error(f"Error writing to Kinesis: {str(e)}")
-        metrics.add_metric(name="Kinesis_StreamError", unit="Count", value=1)
-        return 0
+        logger.error(f"Error writing to Kinesis: {str(e)}", exc_info=True)
+        return {'count': 0, 'error': str(e)}
 
 
-def update_dynamodb(vehicles: List[Dict]) -> int:
-    """
-    Update DynamoDB with current station states
+def update_dynamodb(vehicle_records: List[Dict]) -> Dict:
+    """Update DynamoDB with current station arrival state"""
 
-    Args:
-        vehicles: List of vehicle records
-
-    Returns:
-        Number of records updated
-    """
     try:
-        if not vehicles:
-            logger.warning("No vehicle records to update in DynamoDB")
-            return 0
-
         table = dynamodb_resource.Table(DYNAMODB_TABLE)
+        count = 0
+        errors = 0
 
-        logger.info(f"Updating DynamoDB table {DYNAMODB_TABLE} with {len(vehicles)} records")
-
-        updated_count = 0
-
-        # Group by station_id
+        # Group records by station
         stations = {}
-        for vehicle in vehicles:
-            station_id = vehicle.get('current_stop', 'UNKNOWN')
+        for record in vehicle_records:
+            station_id = record.get('current_stop')
+            if not station_id:
+                continue
+
             if station_id not in stations:
-                stations[station_id] = []
-            stations[station_id].append(vehicle)
+                stations[station_id] = {
+                    'route_id': record.get('route_id'),
+                    'arrivals': []
+                }
 
-        # Write aggregated state for each station
+            arrival = {
+                'line': record.get('route_id'),
+                'arrival_seconds': record.get('next_arrival_seconds', 0),
+                'destination': record.get('headsign', 'Unknown'),
+                'vehicle_id': record.get('vehicle_id'),
+                'arrival_time': record.get('arrival_time'),
+                'delay_seconds': record.get('arrival_delay_seconds', 0),
+                'timestamp': record.get('timestamp')
+            }
+            stations[station_id]['arrivals'].append(arrival)
+
+        # Update DynamoDB for each station
         now_unix = int(datetime.now(timezone.utc).timestamp())
-        expiration_time = now_unix + 600  # 10 minutes from now (TTL)
-
-        for station_id, vehicles_at_station in stations.items():
+        for station_id, data in stations.items():
             try:
-                # Build next_arrivals array
-                next_arrivals = [
-                    {
-                        'line': v.get('route_id'),
-                        'arrival_seconds': v.get('next_arrival_seconds'),
-                        'destination': v.get('headsign', 'Unknown'),
-                        'vehicle_id': v.get('vehicle_id')
-                    }
-                    for v in vehicles_at_station
-                ]
+                expiration_time = now_unix + 600  # 10 minute TTL
 
-                table.put_item(
-                    Item={
+                table.update_item(
+                    Key={
                         'station_id': station_id,
-                        'timestamp': now_unix,
-                        'station_name': f"Station {station_id}",  # TODO: lookup from GTFS
-                        'lines': list(set(v.get('route_id') for v in vehicles_at_station)),
-                        'next_arrivals': next_arrivals,
-                        'active_alerts': [],  # TODO: parse alerts
-                        'crowding_estimate': 'UNKNOWN',  # TODO: estimate from ML
-                        'last_update': now_unix,
-                        'expiration_time': expiration_time
+                        'timestamp': now_unix
+                    },
+                    UpdateExpression=(
+                        'SET station_name = :sn, '
+                        'next_arrivals = list_append(if_not_exists(next_arrivals, :empty_list), :arrivals), '
+                        'last_update = :now, '
+                        'expiration_time = :exp '
+                    ),
+                    ExpressionAttributeValues={
+                        ':sn': f"Station {station_id}",  # TODO: lookup from GTFS static data
+                        ':arrivals': [data['arrivals'][:10]],  # Keep last 10 arrivals
+                        ':empty_list': [],
+                        ':now': now_unix,
+                        ':exp': expiration_time
                     }
                 )
-                updated_count += 1
+                count += 1
 
             except Exception as e:
-                logger.error(f"Failed to update station {station_id}: {str(e)}")
+                logger.error(f"Error updating station {station_id}: {str(e)}")
+                errors += 1
+                continue
 
-        metrics.add_metric(name="DynamoDB_StationsUpdated", unit="Count", value=updated_count)
-        logger.info(f"Successfully updated {updated_count} stations in DynamoDB")
-
-        return updated_count
+        logger.info(f"✓ Updated {count} stations in DynamoDB ({errors} errors)")
+        return {'count': count, 'errors': errors}
 
     except Exception as e:
-        logger.error(f"Error updating DynamoDB: {str(e)}")
-        metrics.add_metric(name="DynamoDB_UpdateError", unit="Count", value=1)
-        return 0
+        logger.error(f"Error updating DynamoDB: {str(e)}", exc_info=True)
+        return {'count': 0, 'error': str(e)}

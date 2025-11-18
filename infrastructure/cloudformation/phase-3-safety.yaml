@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SmartRoute Phase 3 - Safety Intelligence with Crime & 311 Data'
+
+Parameters:
+  DataLakeBucket:
+    Type: String
+    Default: smartroute-data-lake-069899605581
+    Description: S3 bucket for data lake
+
+Resources:
+  # ===== IAM Roles =====
+  
+  CrimePollerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${DataLakeBucket}/raw/crime/*'
+        - PolicyName: GlueJobExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: '*'
+
+  ComplaintsPollerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${DataLakeBucket}/raw/311/*'
+        - PolicyName: GlueJobExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: '*'
+
+  SafetyEnrichmentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataLakeBucket}'
+                  - !Sub 'arn:aws:s3:::${DataLakeBucket}/processed/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${DataLakeBucket}/processed/safety_enriched/*'
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${DataLakeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${DataLakeBucket}'
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:*
+                Resource: '*'
+        - PolicyName: LogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # ===== Lambda Functions =====
+
+  CrimePollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartroute-crime-poller
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CrimePollerLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Crime poller deployed')}
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataLakeBucket
+
+  ComplaintsPollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartroute-complaints-311-poller
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ComplaintsPollerLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('311 poller deployed')}
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataLakeBucket
+
+  SafetyEnrichmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: smartroute-safety-enrichment
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SafetyEnrichmentLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Safety enrichment deployed')}
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataLakeBucket
+
+  # ===== EventBridge Rules =====
+
+  CrimePollerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: smartroute-crime-poller-daily
+      Description: Trigger crime poller daily at 2 AM UTC
+      ScheduleExpression: 'cron(0 2 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CrimePollerFunction.Arn
+          Id: CrimePollerTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  ComplaintsPollerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: smartroute-complaints-311-poller-6h
+      Description: Trigger 311 poller every 6 hours
+      ScheduleExpression: 'rate(6 hours)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplaintsPollerFunction.Arn
+          Id: ComplaintsPollerTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  SafetyEnrichmentScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: smartroute-safety-enrichment-hourly
+      Description: Trigger safety enrichment hourly
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SafetyEnrichmentFunction.Arn
+          Id: SafetyEnrichmentTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # Lambda permissions for EventBridge
+  CrimePollerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CrimePollerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CrimePollerScheduleRule.Arn
+
+  ComplaintsPollerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplaintsPollerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplaintsPollerScheduleRule.Arn
+
+  SafetyEnrichmentInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SafetyEnrichmentFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SafetyEnrichmentScheduleRule.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CrimePollerFunction.Arn
+                  - !GetAtt ComplaintsPollerFunction.Arn
+                  - !GetAtt SafetyEnrichmentFunction.Arn
+
+  # ===== Glue Jobs =====
+
+  CrimeNormalizationJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: smartroute-crime-normalization
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DataLakeBucket}/scripts/glue_crime_normalization.py'
+        PythonVersion: '3'
+      MaxCapacity: 2.0
+      GlueVersion: '4.0'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-enable
+        '--TempDir': !Sub 's3://${DataLakeBucket}/temp'
+        '--S3_INPUT_PATH': !Sub 's3://${DataLakeBucket}/raw/crime'
+        '--S3_OUTPUT_PATH': !Sub 's3://${DataLakeBucket}/processed/crime_by_station'
+
+  ComplaintsNormalizationJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: smartroute-311-normalization
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DataLakeBucket}/scripts/glue_311_normalization.py'
+        PythonVersion: '3'
+      MaxCapacity: 2.0
+      GlueVersion: '4.0'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-enable
+        '--TempDir': !Sub 's3://${DataLakeBucket}/temp'
+        '--S3_INPUT_PATH': !Sub 's3://${DataLakeBucket}/raw/311'
+        '--S3_OUTPUT_PATH': !Sub 's3://${DataLakeBucket}/processed/311_by_station'
+
+  # ===== CloudWatch Alarms =====
+
+  CrimePollerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: smartroute-crime-poller-errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CrimePollerFunction
+
+  ComplaintsPollerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: smartroute-complaints-311-poller-errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ComplaintsPollerFunction
+
+Outputs:
+  CrimePollerFunctionArn:
+    Description: Crime Poller Lambda ARN
+    Value: !GetAtt CrimePollerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CrimePollerArn'
+
+  ComplaintsPollerFunctionArn:
+    Description: Complaints 311 Poller Lambda ARN
+    Value: !GetAtt ComplaintsPollerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplaintsPollerArn'
+
+  SafetyEnrichmentFunctionArn:
+    Description: Safety Enrichment Lambda ARN
+    Value: !GetAtt SafetyEnrichmentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SafetyEnrichmentArn'
+
+  CrimeNormalizationJobName:
+    Description: Crime Normalization Glue Job
+    Value: !Ref CrimeNormalizationJob
+    Export:
+      Name: !Sub '${AWS::StackName}-CrimeNormalizationJob'
+
+  ComplaintsNormalizationJobName:
+    Description: 311 Normalization Glue Job
+    Value: !Ref ComplaintsNormalizationJob
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplaintsNormalizationJob'
