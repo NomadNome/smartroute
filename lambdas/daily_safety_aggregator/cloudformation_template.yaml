@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SmartRoute Safety Scores DynamoDB Table - Pre-computed daily aggregation cache'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for tagging
+
+Resources:
+  SafetyScoresTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SmartRoute_Safety_Scores
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: station_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: station_name
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: SmartRoute
+        - Key: Phase
+          Value: '5-Production'
+        - Key: Purpose
+          Value: Safety-Scores-Cache
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  TableName:
+    Description: DynamoDB Table Name
+    Value: !Ref SafetyScoresTable
+    Export:
+      Name: SmartRoute-Safety-Scores-Table
+
+  TableArn:
+    Description: DynamoDB Table ARN
+    Value: !GetAtt SafetyScoresTable.Arn
+    Export:
+      Name: SmartRoute-Safety-Scores-Table-ARN
+
+  TableStreamArn:
+    Description: DynamoDB Table Stream ARN
+    Value: !GetAtt SafetyScoresTable.StreamArn
+    Export:
+      Name: SmartRoute-Safety-Scores-Table-Stream-ARN

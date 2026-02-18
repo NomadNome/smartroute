@@ -889,18 +889,24 @@ const SUBWAY_LINES = {
  */
 app.post('/api/routes/recommend', async (req, res) => {
   try {
-    const API_GATEWAY_URL = 'https://fm5gv3woye.execute-api.us-east-1.amazonaws.com/prod/recommend';
+    // Phase 5 Deployed API Gateway (CloudFormation)
+    const API_GATEWAY_URL = 'https://6ohbwphgql.execute-api.us-east-1.amazonaws.com/prod/recommend';
+    const API_KEY = 'vVA3LNSQOK408cy44isS9aLVw9tEEtDb7X5d68dU'; // SmartRoute API Key (actual key value, not ID)
 
-    // Proxy the request to AWS API Gateway
+    // Proxy the request to AWS API Gateway with API Key authentication
     const response = await fetch(API_GATEWAY_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY
+      },
       body: JSON.stringify(req.body)
     });
 
     const data = await response.json();
 
     if (!response.ok) {
+      console.error('API Gateway error:', response.status, data);
       return res.status(response.status).json(data);
     }
 
@@ -1011,6 +1017,49 @@ app.post('/api/routes/geocode', (req, res) => {
     console.error('Error getting geocode candidates:', error);
     res.status(503).json({
       error: `Unable to get candidates: ${error.message}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * GET /api/incidents/latest
+ * Proxy endpoint for fetching latest crime/311 incidents from Lambda
+ */
+app.get('/api/incidents/latest', async (req, res) => {
+  try {
+    const API_URL = 'https://6ohbwphgql.execute-api.us-east-1.amazonaws.com/prod/incidents';
+    const API_KEY = 'vVA3LNSQOK408cy44isS9aLVw9tEEtDb7X5d68dU';
+
+    // Build query string
+    const queryParams = new URLSearchParams();
+    if (req.query.limit) queryParams.append('limit', req.query.limit);
+    if (req.query.type) queryParams.append('type', req.query.type);
+
+    const url = queryParams.toString() ? `${API_URL}?${queryParams}` : API_URL;
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`API returned ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // Return the incidents data with CORS headers already applied by Express
+    res.json(data);
+
+  } catch (error) {
+    console.error('Error fetching incidents:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
       timestamp: new Date().toISOString()
     });
   }

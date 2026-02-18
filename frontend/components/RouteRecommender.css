@@ -1,14 +1,48 @@
-/* RouteRecommender Component Styles */
+/* SmartRoute - Modern Web Design (Inspired by Uber, Stripe, Vercel) */
 
+:root {
+  /* Color System */
+  --color-bg-primary: #ffffff;
+  --color-bg-secondary: #f9fafb;
+  --color-bg-tertiary: #f3f4f6;
+  --color-text-primary: #111827;
+  --color-text-secondary: #6b7280;
+  --color-text-tertiary: #9ca3af;
+  --color-border: #e5e7eb;
+  --color-border-light: #f3f4f6;
+  --color-accent: #2563eb;
+  --color-accent-light: #3b82f6;
+  --color-accent-dark: #1d4ed8;
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-danger: #ef4444;
+  --color-shadow: rgba(0, 0, 0, 0.05);
+  --color-shadow-lg: rgba(0, 0, 0, 0.1);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  line-height: 1.5;
+}
+
+/* Container */
 .route-recommender-container {
   min-height: 100vh;
-  background: linear-gradient(to bottom right, #f0f4ff, #e0e7ff);
-  padding: 1.5rem;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  background: var(--color-bg-primary);
+  padding: 40px 20px;
 }
 
 .route-recommender-wrapper {
@@ -16,36 +50,40 @@
   margin: 0 auto;
 }
 
-/* Header */
+/* Header Section */
 .route-recommender-header {
-  text-align: center;
-  margin-bottom: 2rem;
+  margin-bottom: 48px;
+  text-align: left;
 }
 
 .route-recommender-title {
-  font-size: 2.25rem;
-  font-weight: bold;
-  color: #111827;
-  margin: 0 0 0.5rem 0;
-  letter-spacing: -0.025em;
+  font-size: 40px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin: 0 0 8px 0;
+  letter-spacing: -0.02em;
 }
 
 .route-recommender-subtitle {
-  font-size: 1.25rem;
-  color: #4b5563;
+  font-size: 18px;
+  color: var(--color-text-secondary);
   margin: 0;
+  font-weight: 400;
+  line-height: 1.6;
 }
 
 /* Grid Layout */
 .route-recommender-grid {
   display: grid;
-  grid-template-columns: 1fr 2fr;
-  gap: 1.5rem;
+  grid-template-columns: 1fr 380px;
+  gap: 32px;
+  align-items: start;
 }
 
-@media (max-width: 1024px) {
+@media (max-width: 1200px) {
   .route-recommender-grid {
     grid-template-columns: 1fr;
+    gap: 24px;
   }
 }
 
@@ -53,394 +91,536 @@
 .route-recommender-form-section {
   display: flex;
   flex-direction: column;
+  gap: 24px;
 }
 
+/* Card Base */
 .route-recommender-card {
-  background: white;
-  border-radius: 0.5rem;
-  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
-  padding: 1.5rem;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 32px;
+  box-shadow: 0 1px 3px var(--color-shadow);
+  transition: all 0.25s ease;
 }
 
-.route-recommender-card.sticky-form {
-  position: sticky;
-  top: 1.5rem;
+.route-recommender-card:hover {
+  border-color: var(--color-accent-light);
+  box-shadow: 0 4px 16px rgba(37, 99, 235, 0.1);
 }
 
 .route-recommender-card-title {
-  font-size: 1.5rem;
-  font-weight: bold;
-  margin: 0 0 1.5rem 0;
-  color: #111827;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0 0 24px 0;
 }
 
 /* Form Elements */
 .route-recommender-form {
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 20px;
 }
 
 .form-group {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 8px;
 }
 
 .form-label {
-  font-size: 0.875rem;
+  font-size: 14px;
   font-weight: 500;
-  color: #374151;
-  margin: 0;
+  color: var(--color-text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
-.form-input {
-  padding: 0.5rem 1rem;
-  border: 1px solid #d1d5db;
-  border-radius: 0.375rem;
-  font-size: 1rem;
-  transition: all 0.2s;
+.form-input,
+.form-select {
+  padding: 12px 16px;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  color: var(--color-text-primary);
+  font-size: 15px;
   font-family: inherit;
-}
-
-.form-input:focus {
-  outline: none;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-  border-color: #3b82f6;
+  transition: all 0.2s ease;
 }
 
 .form-input::placeholder {
-  color: #9ca3af;
+  color: var(--color-text-tertiary);
+}
+
+.form-input:focus,
+.form-select:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+  background: var(--color-bg-primary);
 }
 
 /* Radio Group */
 .radio-group {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 12px;
+  margin-top: 8px;
 }
 
 .radio-label {
   display: flex;
   align-items: center;
+  gap: 12px;
   cursor: pointer;
-  gap: 0.75rem;
-  padding: 0.25rem 0;
+  padding: 8px 0;
+  font-size: 15px;
+  color: var(--color-text-primary);
 }
 
 .radio-input {
-  width: 1rem;
-  height: 1rem;
   cursor: pointer;
-  accent-color: #3b82f6;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-accent);
 }
 
 .radio-text {
-  font-size: 0.875rem;
-  color: #374151;
-  cursor: pointer;
+  font-weight: 500;
 }
 
 /* Submit Button */
 .submit-button {
-  background-color: #2563eb;
+  padding: 12px 24px;
+  background: linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-dark) 100%);
   color: white;
-  font-weight: bold;
-  padding: 0.75rem 1rem;
   border: none;
-  border-radius: 0.375rem;
-  font-size: 1rem;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s;
-  margin-top: 0.5rem;
-  font-family: inherit;
+  transition: all 0.25s ease;
+  width: 100%;
+  margin-top: 8px;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);
 }
 
 .submit-button:hover:not(:disabled) {
-  background-color: #1d4ed8;
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(37, 99, 235, 0.3);
+  background: linear-gradient(135deg, var(--color-accent-light) 0%, var(--color-accent) 100%);
+}
+
+.submit-button:active:not(:disabled) {
+  transform: translateY(0);
 }
 
 .submit-button:disabled {
-  background-color: #9ca3af;
+  opacity: 0.6;
   cursor: not-allowed;
+  transform: none;
 }
 
 /* Error Message */
 .error-message {
-  margin-top: 1rem;
-  padding: 1rem;
-  background-color: #fef2f2;
-  border: 1px solid #fecaca;
-  border-radius: 0.375rem;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  padding: 16px;
+  color: #991b1b;
+  font-size: 14px;
+  margin-top: 12px;
 }
 
-.error-message p {
-  margin: 0;
-  color: #7f1d1d;
-  font-size: 0.875rem;
+/* Loading State */
+.route-recommender-loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 60px 20px;
+  color: var(--color-text-secondary);
+  font-size: 15px;
+  gap: 12px;
+}
+
+.spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 /* Results Section */
 .route-recommender-results-section {
   display: flex;
   flex-direction: column;
+  gap: 24px;
 }
 
 .route-recommender-results {
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 20px;
 }
 
-/* Route Info */
+.route-results-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.route-results-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.route-results-count {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+}
+
+/* Route Info Card */
 .route-info-header {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  margin-bottom: 1rem;
+  align-items: flex-start;
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--color-border);
 }
 
 .route-info-title {
-  font-size: 1.125rem;
-  font-weight: bold;
-  color: #111827;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text-primary);
   margin: 0;
 }
 
 .cached-badge {
-  font-size: 0.75rem;
-  background-color: #dbeafe;
-  color: #1e40af;
-  padding: 0.25rem 0.75rem;
-  border-radius: 9999px;
-  white-space: nowrap;
+  background: var(--color-success);
+  color: white;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
 }
 
 .route-info-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 1rem;
+  gap: 24px;
+  margin-bottom: 20px;
 }
 
 .route-info-item {
   display: flex;
   flex-direction: column;
+  gap: 4px;
 }
 
 .route-info-label {
-  font-size: 0.875rem;
-  color: #6b7280;
-  margin: 0 0 0.25rem 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0;
 }
 
 .route-info-station {
+  font-size: 16px;
   font-weight: 600;
-  color: #111827;
+  color: var(--color-text-primary);
   margin: 0;
-  font-size: 1rem;
 }
 
 .route-info-distance {
-  font-size: 0.75rem;
-  color: #6b7280;
-  margin: 0.25rem 0 0 0;
-}
-
-/* Route Option Card */
-.route-option-card {
-  border-left: 4px solid #3b82f6;
-  transition: box-shadow 0.3s;
-}
-
-.route-option-card:hover {
-  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
-}
-
-.route-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  margin-bottom: 1rem;
-}
-
-.route-name {
-  font-size: 1.25rem;
-  font-weight: bold;
-  color: #111827;
-  margin: 0 0 0.25rem 0;
-}
-
-.route-lines {
-  font-size: 0.875rem;
-  color: #6b7280;
+  font-size: 13px;
+  color: var(--color-text-secondary);
   margin: 0;
 }
 
-.time-badge {
-  background-color: #dbeafe;
-  color: #1e40af;
-  padding: 0.5rem 1rem;
-  border-radius: 9999px;
-  font-weight: bold;
-  white-space: nowrap;
+/* Route Card Styles */
+.route-card {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 20px;
+  transition: all 0.25s ease;
+  margin-bottom: 0;
 }
 
-/* Scores Grid */
-.scores-grid {
+.route-card:hover {
+  border-color: var(--color-accent-light);
+  box-shadow: 0 4px 16px rgba(37, 99, 235, 0.08);
+  transform: translateY(-2px);
+}
+
+.route-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.route-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.route-card-time {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+/* Score Cards */
+.route-card-stats {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1rem;
-  margin-bottom: 1rem;
-}
-
-@media (max-width: 640px) {
-  .scores-grid {
-    grid-template-columns: 1fr;
-  }
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 16px;
 }
 
 .score-card {
-  padding: 0.75rem;
-  border-radius: 0.375rem;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  padding: 12px;
+  text-align: center;
+  transition: all 0.2s ease;
 }
 
-.score-green {
-  color: #15803d;
-  background-color: #f0fdf4;
+.score-card.score-green {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.2);
 }
 
-.score-yellow {
-  color: #854d0e;
-  background-color: #fffbeb;
+.score-card.score-yellow {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.2);
 }
 
-.score-red {
-  color: #7f1d1d;
-  background-color: #fef2f2;
+.score-card.score-red {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.2);
 }
 
 .score-header {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.25rem;
-}
-
-.score-header svg {
-  flex-shrink: 0;
+  margin-bottom: 8px;
 }
 
 .score-label {
-  font-size: 0.75rem;
-  font-weight: 600;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 500;
 }
 
 .score-value {
-  font-size: 1.125rem;
-  font-weight: bold;
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin: 4px 0;
+}
+
+.score-value.safe {
+  color: var(--color-success);
+}
+
+.score-value.warning {
+  color: var(--color-warning);
+}
+
+.score-value.danger {
+  color: var(--color-danger);
+}
+
+.score-explanation {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
   margin: 0;
 }
 
 /* Stations Section */
 .stations-section {
-  margin-bottom: 1rem;
+  margin-bottom: 16px;
+  padding: 12px;
+  background: var(--color-bg-tertiary);
+  border-radius: 8px;
+  border: 1px solid var(--color-border-light);
 }
 
 .stations-label {
-  font-size: 0.75rem;
+  font-size: 12px;
   font-weight: 600;
-  color: #6b7280;
-  margin: 0 0 0.5rem 0;
+  color: var(--color-text-secondary);
   text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0 0 12px 0;
 }
 
 .stations-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 8px;
 }
 
 .station-badge {
-  font-size: 0.75rem;
-  background-color: #f3f4f6;
-  color: #374151;
-  padding: 0.25rem 0.75rem;
-  border-radius: 9999px;
-  white-space: nowrap;
+  background: var(--color-accent);
+  color: white;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+.station-badge:hover {
+  background: var(--color-accent-dark);
+  transform: translateY(-1px);
+}
+
+.station-badge.transfer-badge {
+  background: var(--color-warning);
+  color: var(--color-text-primary);
+}
+
+.station-badge.transfer-badge:hover {
+  background: #d97706;
 }
 
 /* Explanation Section */
 .explanation-section {
-  background-color: #f9fafb;
-  padding: 1rem;
-  border-radius: 0.375rem;
+  padding: 12px;
+  background: rgba(37, 99, 235, 0.05);
+  border-left: 3px solid var(--color-accent);
+  border-radius: 4px;
+  margin-top: 16px;
 }
 
 .explanation-text {
-  margin: 0;
-  color: #374151;
-  font-size: 0.875rem;
-  line-height: 1.5;
+  font-size: 13px;
+  color: var(--color-text-secondary);
   font-style: italic;
+  margin: 0;
+  line-height: 1.6;
 }
 
 /* Empty State */
 .empty-state {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 400px;
+  text-align: center;
+  padding: 60px 20px;
+  background: var(--color-bg-secondary);
+  border-radius: 12px;
+  border: 1px dashed var(--color-border);
 }
 
 .empty-state-content {
-  text-align: center;
-  padding: 2rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
 }
 
 .empty-state-icon {
-  margin-bottom: 1rem;
-  color: #d1d5db;
-  display: flex;
-  justify-content: center;
-}
-
-.empty-state-icon svg {
-  width: 48px;
-  height: 48px;
+  font-size: 48px;
+  opacity: 0.5;
 }
 
 .empty-state-text {
+  font-size: 15px;
+  color: var(--color-text-secondary);
   margin: 0;
-  color: #6b7280;
-  font-size: 1.125rem;
-  line-height: 1.5;
-  max-width: 400px;
+  max-width: 300px;
+  line-height: 1.6;
+}
+
+/* Incidents Section */
+.route-incidents-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  height: fit-content;
+  position: sticky;
+  top: 40px;
+}
+
+@media (max-width: 1200px) {
+  .route-incidents-section {
+    position: relative;
+    top: 0;
+  }
 }
 
 /* Responsive Design */
 @media (max-width: 768px) {
+  .route-recommender-container {
+    padding: 24px 16px;
+  }
+
+  .route-recommender-header {
+    margin-bottom: 32px;
+  }
+
   .route-recommender-title {
-    font-size: 1.875rem;
+    font-size: 28px;
   }
 
   .route-recommender-subtitle {
-    font-size: 1rem;
+    font-size: 16px;
   }
 
   .route-recommender-card {
-    padding: 1rem;
+    padding: 24px;
   }
 
-  .route-name {
-    font-size: 1.125rem;
+  .route-info-grid {
+    grid-template-columns: 1fr;
   }
 
-  .route-header {
-    flex-direction: column;
-    gap: 0.5rem;
+  .route-card-stats {
+    grid-template-columns: 1fr 1fr;
   }
 
-  .time-badge {
-    align-self: flex-start;
+  .empty-state {
+    padding: 40px 16px;
+  }
+}
+
+/* Accessibility */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Print Styles */
+@media print {
+  body {
+    background: white;
+    color: black;
+  }
+
+  .route-recommender-card {
+    page-break-inside: avoid;
+    box-shadow: none;
+    border: 1px solid #ddd;
   }
 }

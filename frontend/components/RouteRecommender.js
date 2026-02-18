@@ -3,7 +3,8 @@
  * Fully compatible with external script loading
  */
 
-const API_ENDPOINT = '/api/routes/recommend';
+const API_ENDPOINT = 'https://6ohbwphgql.execute-api.us-east-1.amazonaws.com/prod/recommend';
+const API_KEY = 'vVA3LNSQOK408cy44isS9aLVw9tEEtDb7X5d68dU';
 
 const RouteRecommender = () => {
   const [originAddress, setOriginAddress] = React.useState('');
@@ -21,7 +22,10 @@ const RouteRecommender = () => {
     try {
       const res = await fetch(API_ENDPOINT, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': API_KEY
+        },
         body: JSON.stringify({
           origin_address: originAddress,
           destination_address: destinationAddress,
@@ -47,6 +51,81 @@ const RouteRecommender = () => {
     if (score >= 8) return 'score-green';
     if (score >= 6) return 'score-yellow';
     return 'score-red';
+  };
+
+  const formatStationsWithTransfers = (route) => {
+    /**
+     * Format stations list to show transfers clearly.
+     * Uses segments data if available, otherwise detects duplicate consecutive stations.
+     */
+
+    // If we have segments data, use it to identify transfers
+    if (route.segments && Array.isArray(route.segments)) {
+      const displayItems = [];
+      const transfers = {};
+
+      // Map transfers by station
+      for (const segment of route.segments) {
+        if (segment.type === 'transfer') {
+          transfers[segment.station] = {
+            from_line: segment.from_line,
+            to_line: segment.to_line
+          };
+        }
+      }
+
+      // Build display items from stations
+      for (let i = 0; i < route.stations.length; i++) {
+        const station = route.stations[i];
+
+        // Skip duplicate consecutive stations (they'll be handled as transfers)
+        if (i > 0 && route.stations[i] === route.stations[i - 1]) {
+          continue;
+        }
+
+        // Check if this is a transfer point
+        if (transfers[station]) {
+          const t = transfers[station];
+          displayItems.push({
+            station: station,
+            label: `${station} (${t.from_line}→${t.to_line} transfer)`,
+            isTransfer: true
+          });
+        } else {
+          displayItems.push({
+            station: station,
+            label: station,
+            isTransfer: false
+          });
+        }
+      }
+
+      return displayItems;
+    }
+
+    // Fallback: detect duplicate consecutive stations
+    const displayItems = [];
+    for (let i = 0; i < route.stations.length; i++) {
+      const station = route.stations[i];
+
+      // Skip duplicate consecutive stations
+      if (i > 0 && route.stations[i] === route.stations[i - 1]) {
+        // Mark previous item as having a transfer if not already marked
+        if (displayItems.length > 0 && !displayItems[displayItems.length - 1].isTransfer) {
+          displayItems[displayItems.length - 1].label = station + ' (transfer)';
+          displayItems[displayItems.length - 1].isTransfer = true;
+        }
+        continue;
+      }
+
+      displayItems.push({
+        station: station,
+        label: station,
+        isTransfer: false
+      });
+    }
+
+    return displayItems;
   };
 
   return React.createElement(
@@ -89,7 +168,7 @@ const RouteRecommender = () => {
             React.createElement(
               'form',
               { onSubmit: handleSubmit, className: 'route-recommender-form' },
-              // Origin Address Input
+              // Origin Address Input with Suggestions
               React.createElement(
                 'div',
                 { className: 'form-group' },
@@ -98,16 +177,16 @@ const RouteRecommender = () => {
                   { className: 'form-label' },
                   'Origin Address'
                 ),
-                React.createElement('input', {
-                  type: 'text',
+                React.createElement(window.AddressSuggestions, {
                   value: originAddress,
-                  onChange: (e) => setOriginAddress(e.target.value),
-                  placeholder: 'e.g., 200 East 42nd Street, New York, NY',
-                  className: 'form-input',
-                  required: true,
+                  onChange: setOriginAddress,
+                  onSelect: (stationName) => {
+                    setOriginAddress(stationName);
+                  },
+                  placeholder: 'e.g., 200 East 42nd Street, New York, NY'
                 })
               ),
-              // Destination Address Input
+              // Destination Address Input with Suggestions
               React.createElement(
                 'div',
                 { className: 'form-group' },
@@ -116,13 +195,13 @@ const RouteRecommender = () => {
                   { className: 'form-label' },
                   'Destination Address'
                 ),
-                React.createElement('input', {
-                  type: 'text',
+                React.createElement(window.AddressSuggestions, {
                   value: destinationAddress,
-                  onChange: (e) => setDestinationAddress(e.target.value),
-                  placeholder: 'e.g., 1 Battery Park, New York, NY',
-                  className: 'form-input',
-                  required: true,
+                  onChange: setDestinationAddress,
+                  onSelect: (stationName) => {
+                    setDestinationAddress(stationName);
+                  },
+                  placeholder: 'e.g., 1 Battery Park, New York, NY'
                 })
               ),
               // Preference Selection
@@ -266,13 +345,13 @@ const RouteRecommender = () => {
                           React.createElement(
                             'p',
                             { className: 'route-lines' },
-                            'Lines: ' + route.line
+                            'Lines: ' + (route.lines && route.lines.length > 0 ? route.lines.join(', ') : 'N/A')
                           )
                         ),
                         React.createElement(
                           'div',
                           { className: 'time-badge' },
-                          route.time_minutes + ' min'
+                          (route.total_time_minutes !== undefined ? route.total_time_minutes : route.estimated_time_minutes || route.time_minutes || 'N/A') + ' min'
                         )
                       ),
                       // Scores Grid
@@ -281,7 +360,7 @@ const RouteRecommender = () => {
                         { className: 'scores-grid' },
                         React.createElement(
                           'div',
-                          { className: 'score-card ' + getScoreColor(route.safety_score) },
+                          { className: 'score-card ' + getScoreColor(route.safety_score), title: 'Based on crime incidents near stations (lower crime = higher safety score, 0-10)' },
                           React.createElement(
                             'div',
                             { className: 'score-header' },
@@ -291,11 +370,16 @@ const RouteRecommender = () => {
                             'p',
                             { className: 'score-value' },
                             route.safety_score.toFixed(1)
+                          ),
+                          React.createElement(
+                            'p',
+                            { className: 'score-explanation' },
+                            'Crime incidents in area'
                           )
                         ),
                         React.createElement(
                           'div',
-                          { className: 'score-card ' + getScoreColor(route.reliability_score) },
+                          { className: 'score-card ' + getScoreColor(route.reliability_score), title: 'Based on on-time performance of transit lines (higher reliability = fewer delays, 0-10)' },
                           React.createElement(
                             'div',
                             { className: 'score-header' },
@@ -305,11 +389,16 @@ const RouteRecommender = () => {
                             'p',
                             { className: 'score-value' },
                             route.reliability_score.toFixed(1)
+                          ),
+                          React.createElement(
+                            'p',
+                            { className: 'score-explanation' },
+                            'On-time performance'
                           )
                         ),
                         React.createElement(
                           'div',
-                          { className: 'score-card ' + getScoreColor(route.efficiency_score) },
+                          { className: 'score-card ' + getScoreColor(route.efficiency_score), title: 'Based on travel time and number of transfers (direct routes = higher efficiency, 0-10)' },
                           React.createElement(
                             'div',
                             { className: 'score-header' },
@@ -319,6 +408,11 @@ const RouteRecommender = () => {
                             'p',
                             { className: 'score-value' },
                             route.efficiency_score.toFixed(1)
+                          ),
+                          React.createElement(
+                            'p',
+                            { className: 'score-explanation' },
+                            'Travel time & transfers'
                           )
                         )
                       ),
@@ -335,11 +429,14 @@ const RouteRecommender = () => {
                           'div',
                           { className: 'stations-list' },
                           route.stations &&
-                            route.stations.map((station, i) =>
+                            formatStationsWithTransfers(route).map((item, i) =>
                               React.createElement(
                                 'span',
-                                { key: i, className: 'station-badge' },
-                                station
+                                {
+                                  key: i,
+                                  className: 'station-badge' + (item.isTransfer ? ' transfer-badge' : '')
+                                },
+                                item.label
                               )
                             )
                         )
@@ -375,6 +472,12 @@ const RouteRecommender = () => {
                   )
                 )
               )
+        ),
+        // Incidents Feed Section (Right Column)
+        React.createElement(
+          'div',
+          { className: 'route-incidents-section' },
+          React.createElement(window.IncidentFeed)
         )
       )
     )

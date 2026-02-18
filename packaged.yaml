@@ -1,0 +1,760 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SmartRoute Phase 5 - Complete Infrastructure as Code (Pure CloudFormation)
+
+  Deploys:
+
+  - 4 DynamoDB tables (on-demand billing)
+
+  - 2 Lambda functions (daily aggregator + route recommender API)
+
+  - API Gateway with API Key authentication
+
+  - CloudWatch dashboards and alarms
+
+  - EventBridge schedule for daily aggregation
+
+  '
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Environment Configuration
+      Parameters:
+      - EnvironmentName
+      - AWSRegion
+    - Label:
+        default: Athena Configuration
+      Parameters:
+      - AthenaDatabase
+      - AthenaOutputBucket
+    - Label:
+        default: API Configuration
+      Parameters:
+      - ApiKeyEnabled
+      - RateLimitPerDay
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues:
+    - development
+    - staging
+    - production
+    Description: Environment name for resource tagging
+  AWSRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for deployment
+  AthenaDatabase:
+    Type: String
+    Default: smartroute_data
+    Description: Athena database name for crime data
+  AthenaOutputBucket:
+    Type: String
+    Default: smartroute-data-lake-069899605581
+    Description: S3 bucket for Athena query results
+  ApiKeyEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Description: Enable API Key authentication
+  RateLimitPerDay:
+    Type: Number
+    Default: 10000
+    MinValue: 100
+    MaxValue: 100000
+    Description: API rate limit per day
+Conditions:
+  IsProduction:
+    Fn::Equals:
+    - Ref: EnvironmentName
+    - production
+  EnableApiKey:
+    Fn::Equals:
+    - Ref: ApiKeyEnabled
+    - 'true'
+
+Resources:
+  RouteCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: smartroute-route-cache
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: cache_key
+        AttributeType: S
+      KeySchema:
+      - AttributeName: cache_key
+        KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+      - Key: Purpose
+        Value: RouteRecommendationCache
+      - Key: TTL
+        Value: 5-minutes
+    Metadata:
+      SamResourceId: RouteCacheTable
+  StationRealtimeStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: smartroute_station_realtime_state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: station_id
+        AttributeType: S
+      - AttributeName: timestamp
+        AttributeType: N
+      KeySchema:
+      - AttributeName: station_id
+        KeyType: HASH
+      - AttributeName: timestamp
+        KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: station-latest-index
+        KeySchema:
+        - AttributeName: station_id
+          KeyType: HASH
+        Projection:
+          ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+      - Key: Purpose
+        Value: RealTimeTrainData
+    Metadata:
+      SamResourceId: StationRealtimeStateTable
+  UserSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: smartroute_user_sessions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: user_id
+        AttributeType: S
+      - AttributeName: session_timestamp
+        AttributeType: N
+      KeySchema:
+      - AttributeName: user_id
+        KeyType: HASH
+      - AttributeName: session_timestamp
+        KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+      - Key: Purpose
+        Value: UserSessionTracking
+    Metadata:
+      SamResourceId: UserSessionsTable
+  SafetyScoresTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SmartRoute_Safety_Scores
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: station_name
+        AttributeType: S
+      KeySchema:
+      - AttributeName: station_name
+        KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+      - Key: Purpose
+        Value: PreComputedSafetyScores
+      - Key: UpdateFrequency
+        Value: Daily-2AM-UTC
+    Metadata:
+      SamResourceId: SafetyScoresTable
+  DailySafetyAggregatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: smartroute-daily-aggregator-role-${EnvironmentName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: AthenaQueryExecution
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: AthenaQueryExecutionPermissions
+            Effect: Allow
+            Action:
+            - athena:StartQueryExecution
+            - athena:GetQueryExecution
+            - athena:GetQueryResults
+            - athena:StopQueryExecution
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion:
+                  Ref: AWSRegion
+      - PolicyName: GlueCatalogAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: GlueDatabaseAndTableAccess
+            Effect: Allow
+            Action:
+            - glue:GetDatabase
+            - glue:GetTable
+            - glue:GetPartitions
+            Resource:
+            - Fn::Sub: arn:aws:glue:${AWSRegion}:${AWS::AccountId}:catalog
+            - Fn::Sub: arn:aws:glue:${AWSRegion}:${AWS::AccountId}:database/${AthenaDatabase}
+            - Fn::Sub: arn:aws:glue:${AWSRegion}:${AWS::AccountId}:table/${AthenaDatabase}/*
+      - PolicyName: S3AthenaResults
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: S3BucketOperations
+            Effect: Allow
+            Action:
+            - s3:GetBucketLocation
+            - s3:ListBucket
+            Resource:
+              Fn::Sub: arn:aws:s3:::${AthenaOutputBucket}
+          - Sid: S3ObjectOperations
+            Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            Resource:
+            - Fn::Sub: arn:aws:s3:::${AthenaOutputBucket}/athena-results/*
+            - Fn::Sub: arn:aws:s3:::${AthenaOutputBucket}/processed/*
+      - PolicyName: DynamoDBSafetyScoresWrite
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: DynamoDBWriteOperations
+            Effect: Allow
+            Action:
+            - dynamodb:PutItem
+            - dynamodb:BatchWriteItem
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:DescribeTable
+            Resource:
+              Fn::GetAtt:
+              - SafetyScoresTable
+              - Arn
+      - PolicyName: CloudWatchMetricsAndLogs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: CloudWatchMetricsPublish
+            Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: '*'
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: SmartRoute/SafetyAggregator
+          - Sid: CloudWatchLogsWrite
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - Fn::Sub: arn:aws:logs:${AWSRegion}:${AWS::AccountId}:log-group:/aws/lambda/daily_safety_aggregator:*
+    Metadata:
+      SamResourceId: DailySafetyAggregatorRole
+  BedrockRouteRecommenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: smartroute-bedrock-lambda-role-${EnvironmentName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: DynamoDBReadAllTables
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: DynamoDBReadOperations
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:BatchGetItem
+            Resource:
+            - Fn::GetAtt:
+              - RouteCacheTable
+              - Arn
+            - Fn::GetAtt:
+              - StationRealtimeStateTable
+              - Arn
+            - Fn::GetAtt:
+              - UserSessionsTable
+              - Arn
+            - Fn::GetAtt:
+              - SafetyScoresTable
+              - Arn
+          - Sid: DynamoDBDescribeTable
+            Effect: Allow
+            Action:
+            - dynamodb:DescribeTable
+            Resource:
+            - Fn::GetAtt:
+              - RouteCacheTable
+              - Arn
+            - Fn::GetAtt:
+              - StationRealtimeStateTable
+              - Arn
+            - Fn::GetAtt:
+              - UserSessionsTable
+              - Arn
+            - Fn::GetAtt:
+              - SafetyScoresTable
+              - Arn
+      - PolicyName: DynamoDBCacheWrite
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: RouteCacheWrite
+            Effect: Allow
+            Action:
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            Resource:
+              Fn::GetAtt:
+              - RouteCacheTable
+              - Arn
+      - PolicyName: BedrockInvokeModel
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: BedrockClaudeHaikuInvoke
+            Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            - bedrock:InvokeModelWithResponseStream
+            Resource:
+            - Fn::Sub: arn:aws:bedrock:${AWSRegion}::inference-profile/us.anthropic.claude-haiku-4-5*
+      - PolicyName: CloudWatchLogsWrite
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: CloudWatchLogsWrite
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - Fn::Sub: arn:aws:logs:${AWSRegion}:${AWS::AccountId}:log-group:/aws/lambda/smartroute-route-recommender:*
+    Metadata:
+      SamResourceId: BedrockRouteRecommenderRole
+  DailySafetyAggregatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: daily_safety_aggregator
+      Description: Daily safety scores aggregation from Athena to DynamoDB
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-tzbfbq77dcyw/5cf9b6e31f0cb913fa33321627055b06
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - DailySafetyAggregatorRole
+        - Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          ATHENA_DATABASE:
+            Ref: AthenaDatabase
+          ATHENA_OUTPUT_LOCATION:
+            Fn::Sub: s3://${AthenaOutputBucket}/athena-results/
+          SAFETY_SCORES_TABLE:
+            Ref: SafetyScoresTable
+          CRIME_DATA_LOOKBACK_DAYS: '7'
+          BATCH_SIZE: '25'
+      Events:
+        DailyAggregation:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 2 * * ? *)
+            Description: Daily safety scores aggregation at 2 AM UTC (low traffic
+              window)
+            Name: daily-safety-aggregation-trigger
+            Enabled: true
+      Tags:
+        Purpose: DailyAggregation
+        Trigger: EventBridge-Schedule
+    Metadata:
+      SamResourceId: DailySafetyAggregatorFunction
+  DailySafetyAggregatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${DailySafetyAggregatorFunction}
+      RetentionInDays:
+        Fn::If:
+        - IsProduction
+        - 90
+        - 30
+    Metadata:
+      SamResourceId: DailySafetyAggregatorLogGroup
+  BedrockRouteRecommenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: smartroute-route-recommender
+      Description: Route recommendation API using Bedrock Claude AI with DynamoDB
+        cache
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-tzbfbq77dcyw/6d89f2fc60541821659cb7b53f8d4402
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - BedrockRouteRecommenderRole
+        - Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          CACHE_TABLE_NAME:
+            Ref: RouteCacheTable
+          REALTIME_TABLE_NAME:
+            Ref: StationRealtimeStateTable
+          SAFETY_SCORES_TABLE:
+            Ref: SafetyScoresTable
+          CACHE_TTL_SECONDS: '300'
+      Events:
+        RecommendEndpoint:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: SmartRouteApiGateway
+            Path: /recommend
+            Method: POST
+            Auth:
+              ApiKeyRequired:
+                Fn::If:
+                - EnableApiKey
+                - true
+                - false
+      Tags:
+        Purpose: RouteRecommendation
+        Trigger: APIGateway-POST
+    Metadata:
+      SamResourceId: BedrockRouteRecommenderFunction
+  BedrockRouteRecommenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${BedrockRouteRecommenderFunction}
+      RetentionInDays:
+        Fn::If:
+        - IsProduction
+        - 90
+        - 30
+    Metadata:
+      SamResourceId: BedrockRouteRecommenderLogGroup
+  SmartRouteApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: SmartRoute-API
+      StageName: prod
+      Description: SmartRoute Route Recommendation API with DynamoDB cache integration
+      TracingEnabled:
+        Fn::If:
+        - IsProduction
+        - true
+        - false
+      MethodSettings:
+      - ResourcePath: /*
+        HttpMethod: '*'
+        LoggingLevel: INFO
+        DataTraceEnabled:
+          Fn::If:
+          - IsProduction
+          - false
+          - true
+        MetricsEnabled: true
+        CacheTtlInSeconds: 300
+        CacheDataEncrypted: true
+      Auth:
+        ApiKeyRequired:
+          Fn::If:
+          - EnableApiKey
+          - true
+          - false
+    Metadata:
+      SamResourceId: SmartRouteApiGateway
+  SmartRouteApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: EnableApiKey
+    Properties:
+      Name: SmartRoute-API-Key
+      Description:
+        Fn::Sub: API Key for SmartRoute Route Recommender (${EnvironmentName})
+      Enabled: true
+      StageKeys:
+      - RestApiId:
+          Ref: SmartRouteApiGateway
+        StageName: prod
+    Metadata:
+      SamResourceId: SmartRouteApiKey
+  SmartRouteUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Condition: EnableApiKey
+    DependsOn: SmartRouteApiGateway
+    Properties:
+      UsagePlanName:
+        Fn::Sub: SmartRoute-Usage-Plan-${EnvironmentName}
+      Description: Rate limiting and quota plan for SmartRoute API
+      ApiStages:
+      - ApiId:
+          Ref: SmartRouteApiGateway
+        Stage: prod
+      Quota:
+        Limit:
+          Ref: RateLimitPerDay
+        Period: DAY
+      Throttle:
+        RateLimit:
+          Fn::If:
+          - IsProduction
+          - 100
+          - 50
+        BurstLimit:
+          Fn::If:
+          - IsProduction
+          - 200
+          - 100
+    Metadata:
+      SamResourceId: SmartRouteUsagePlan
+  SmartRouteUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Condition: EnableApiKey
+    Properties:
+      KeyId:
+        Ref: SmartRouteApiKey
+      KeyType: API_KEY
+      UsagePlanId:
+        Ref: SmartRouteUsagePlan
+    Metadata:
+      SamResourceId: SmartRouteUsagePlanKey
+  SmartRouteDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: SmartRoute-Phase5-Dashboard
+      DashboardBody:
+        Fn::Sub: "{\n  \"widgets\": [\n    {\n      \"type\": \"metric\",\n      \"\
+          properties\": {\n        \"metrics\": [\n          [\"SmartRoute/SafetyAggregator\"\
+          , \"ExecutionTime\", {\"stat\": \"Average\"}],\n          [\".\", \"ItemsWritten\"\
+          , {\"stat\": \"Sum\"}],\n          [\".\", \"ItemsFailed\", {\"stat\": \"\
+          Sum\"}],\n          [\".\", \"SuccessRate\", {\"stat\": \"Average\"}]\n\
+          \        ],\n        \"period\": 300,\n        \"stat\": \"Average\",\n\
+          \        \"region\": \"${AWSRegion}\",\n        \"title\": \"Daily Safety\
+          \ Aggregator Performance\",\n        \"yAxis\": {\"left\": {\"min\": 0}}\n\
+          \      }\n    },\n    {\n      \"type\": \"metric\",\n      \"properties\"\
+          : {\n        \"metrics\": [\n          [\"AWS/Lambda\", \"Duration\", {\"\
+          dimensions\": {\"FunctionName\": \"daily_safety_aggregator\"}, \"stat\"\
+          : \"Average\", \"label\": \"Aggregator Duration (ms)\"}],\n          [\"\
+          .\", \"Invocations\", {\"dimensions\": {\"FunctionName\": \"daily_safety_aggregator\"\
+          }, \"stat\": \"Sum\", \"label\": \"Aggregator Invocations\"}],\n       \
+          \   [\".\", \"Errors\", {\"dimensions\": {\"FunctionName\": \"daily_safety_aggregator\"\
+          }, \"stat\": \"Sum\", \"label\": \"Aggregator Errors\"}]\n        ],\n \
+          \       \"period\": 300,\n        \"stat\": \"Average\",\n        \"region\"\
+          : \"${AWSRegion}\",\n        \"title\": \"Daily Aggregator Lambda Metrics\"\
+          \n      }\n    },\n    {\n      \"type\": \"metric\",\n      \"properties\"\
+          : {\n        \"metrics\": [\n          [\"AWS/Lambda\", \"Duration\", {\"\
+          dimensions\": {\"FunctionName\": \"smartroute-route-recommender\"}, \"stat\"\
+          : \"Average\", \"label\": \"Route Recommender Duration (ms)\"}],\n     \
+          \     [\".\", \"Invocations\", {\"dimensions\": {\"FunctionName\": \"smartroute-route-recommender\"\
+          }, \"stat\": \"Sum\", \"label\": \"Route Recommender Invocations\"}],\n\
+          \          [\".\", \"Errors\", {\"dimensions\": {\"FunctionName\": \"smartroute-route-recommender\"\
+          }, \"stat\": \"Sum\", \"label\": \"Route Recommender Errors\"}],\n     \
+          \     [\".\", \"ConcurrentExecutions\", {\"dimensions\": {\"FunctionName\"\
+          : \"smartroute-route-recommender\"}, \"stat\": \"Maximum\", \"label\": \"\
+          Max Concurrent\"}]\n        ],\n        \"period\": 300,\n        \"stat\"\
+          : \"Average\",\n        \"region\": \"${AWSRegion}\",\n        \"title\"\
+          : \"Route Recommender Lambda Performance\"\n      }\n    },\n    {\n   \
+          \   \"type\": \"metric\",\n      \"properties\": {\n        \"metrics\"\
+          : [\n          [\"AWS/DynamoDB\", \"ConsumedReadCapacityUnits\", {\"dimensions\"\
+          : {\"TableName\": \"SmartRoute_Safety_Scores\"}, \"stat\": \"Sum\"}],\n\
+          \          [\".\", \"ConsumedWriteCapacityUnits\", {\"dimensions\": {\"\
+          TableName\": \"SmartRoute_Safety_Scores\"}, \"stat\": \"Sum\"}],\n     \
+          \     [\".\", \"UserErrors\", {\"dimensions\": {\"TableName\": \"SmartRoute_Safety_Scores\"\
+          }, \"stat\": \"Sum\"}]\n        ],\n        \"period\": 300,\n        \"\
+          stat\": \"Average\",\n        \"region\": \"${AWSRegion}\",\n        \"\
+          title\": \"DynamoDB Safety Scores Table - On-Demand Metrics\"\n      }\n\
+          \    },\n    {\n      \"type\": \"metric\",\n      \"properties\": {\n \
+          \       \"metrics\": [\n          [\"AWS/ApiGateway\", \"Count\", {\"dimensions\"\
+          : {\"ApiName\": \"SmartRoute-API\"}, \"stat\": \"Sum\"}],\n          [\"\
+          .\", \"4XXError\", {\"dimensions\": {\"ApiName\": \"SmartRoute-API\"}, \"\
+          stat\": \"Sum\"}],\n          [\".\", \"5XXError\", {\"dimensions\": {\"\
+          ApiName\": \"SmartRoute-API\"}, \"stat\": \"Sum\"}],\n          [\".\",\
+          \ \"Latency\", {\"dimensions\": {\"ApiName\": \"SmartRoute-API\"}, \"stat\"\
+          : \"Average\"}]\n        ],\n        \"period\": 300,\n        \"stat\"\
+          : \"Average\",\n        \"region\": \"${AWSRegion}\",\n        \"title\"\
+          : \"API Gateway Performance\"\n      }\n    }\n  ]\n}\n"
+    Metadata:
+      SamResourceId: SmartRouteDashboard
+  DailySafetyAggregatorFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: SmartRoute-DailySafetyAggregator-Failures-${EnvironmentName}
+      AlarmDescription: Alert if daily_safety_aggregator Lambda fails
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+      - Name: FunctionName
+        Value:
+          Ref: DailySafetyAggregatorFunction
+      TreatMissingData: notBreaching
+      Tags:
+      - Key: Severity
+        Value: High
+    Metadata:
+      SamResourceId: DailySafetyAggregatorFailureAlarm
+  RouteRecommenderHighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: SmartRoute-RouteRecommender-HighLatency-${EnvironmentName}
+      AlarmDescription: Alert if route_recommender Lambda has latency >5 seconds
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: FunctionName
+        Value:
+          Ref: BedrockRouteRecommenderFunction
+      TreatMissingData: notBreaching
+      Tags:
+      - Key: Severity
+        Value: Medium
+    Metadata:
+      SamResourceId: RouteRecommenderHighLatencyAlarm
+  DynamoDBUserErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: SmartRoute-DynamoDB-UserErrors-${EnvironmentName}
+      AlarmDescription: Alert if DynamoDB safety scores table has user errors
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+      - Name: TableName
+        Value:
+          Ref: SafetyScoresTable
+      TreatMissingData: notBreaching
+      Tags:
+      - Key: Severity
+        Value: High
+    Metadata:
+      SamResourceId: DynamoDBUserErrorsAlarm
+Outputs:
+  DailySafetyAggregatorFunctionArn:
+    Description: ARN of Daily Safety Aggregator Lambda Function
+    Value:
+      Fn::GetAtt:
+      - DailySafetyAggregatorFunction
+      - Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-DailySafetyAggregator-Arn
+  BedrockRouteRecommenderFunctionArn:
+    Description: ARN of Bedrock Route Recommender Lambda Function
+    Value:
+      Fn::GetAtt:
+      - BedrockRouteRecommenderFunction
+      - Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-BedrockRouteRecommender-Arn
+  ApiEndpoint:
+    Description: SmartRoute API Endpoint URL
+    Value:
+      Fn::Sub: https://${SmartRouteApiGateway}.execute-api.${AWSRegion}.amazonaws.com/prod/recommend
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ApiEndpoint
+  ApiKeyId:
+    Condition: EnableApiKey
+    Description: API Key ID for accessing the SmartRoute API (use 'aws apigateway
+      get-api-key --id <KeyId> --include-value' to retrieve the key value)
+    Value:
+      Ref: SmartRouteApiKey
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ApiKey-Id
+  RouteCacheTableName:
+    Description: Route Cache DynamoDB Table Name
+    Value:
+      Ref: RouteCacheTable
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-RouteCache-Table
+  StationRealtimeStateTableName:
+    Description: Station Realtime State DynamoDB Table Name
+    Value:
+      Ref: StationRealtimeStateTable
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-StationRealtimeState-Table
+  UserSessionsTableName:
+    Description: User Sessions DynamoDB Table Name
+    Value:
+      Ref: UserSessionsTable
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-UserSessions-Table
+  SafetyScoresTableName:
+    Description: Safety Scores DynamoDB Table Name (Pre-computed daily)
+    Value:
+      Ref: SafetyScoresTable
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-SafetyScores-Table
+  CloudWatchDashboardUrl:
+    Description: CloudWatch Dashboard URL for monitoring
+    Value:
+      Fn::Sub: https://console.aws.amazon.com/cloudwatch/home?region=${AWSRegion}#dashboards:name=SmartRoute-Phase5-Dashboard
+  StackName:
+    Description: CloudFormation Stack Name
+    Value:
+      Ref: AWS::StackName
+  Region:
+    Description: Deployment Region
+    Value:
+      Ref: AWSRegion
+  Environment:
+    Description: Deployment Environment
+    Value:
+      Ref: EnvironmentName

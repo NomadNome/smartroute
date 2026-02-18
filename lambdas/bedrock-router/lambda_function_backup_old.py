@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""
+AWS Lambda: SmartRoute Enhanced Route Recommendation Engine
+Accepts user addresses, converts to stations, fetches real-time train data, and generates AI recommendations
+"""
+
+import json
+import os
+import logging
+import hashlib
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Tuple
+
+import boto3
+from bedrock_route_recommender import BedrockRouteRecommender
+from nyc_stations import get_station_by_coordinates, get_station_info, NYC_STATIONS
+
+# Setup logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize AWS clients
+athena_client = boto3.client('athena', region_name='us-east-1')
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+s3_client = boto3.client('s3', region_name='us-east-1')
+
+# Environment variables
+ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE', 'smartroute_data')
+ATHENA_OUTPUT_LOCATION = os.environ.get('ATHENA_OUTPUT_LOCATION',
+                                        's3://smartroute-data-lake-069899605581/athena-results/')
+CACHE_TABLE_NAME = os.environ.get('CACHE_TABLE_NAME', 'smartroute-route-cache')
+REALTIME_TABLE_NAME = os.environ.get('REALTIME_TABLE_NAME', 'smartroute_station_realtime_state')
+CACHE_TTL_SECONDS = int(os.environ.get('CACHE_TTL_SECONDS', '300'))  # 5 minutes
+
+# Initialize DynamoDB tables
+try:
+    cache_table = dynamodb.Table(CACHE_TABLE_NAME)
+    cache_table.load()
+    logger.info(f"✅ DynamoDB cache table initialized: {CACHE_TABLE_NAME}")
+except Exception as e:
+    logger.warning(f"⚠️  DynamoDB cache table not available: {e}")
+    cache_table = None
+
+try:
+    realtime_table = dynamodb.Table(REALTIME_TABLE_NAME)
+    realtime_table.load()
+    logger.info(f"✅ DynamoDB realtime table initialized: {REALTIME_TABLE_NAME}")
+except Exception as e:
+    logger.warning(f"⚠️  DynamoDB realtime table not available: {e}")
+    realtime_table = None
+
+# Initialize safety scores cache table (Phase 5)
+SAFETY_SCORES_TABLE = 'SmartRoute_Safety_Scores'
+try:
+    safety_table = dynamodb.Table(SAFETY_SCORES_TABLE)
+    # Don't call load() - just verify table exists when we first try to use it
+    logger.info(f"✅ DynamoDB safety scores table initialized: {SAFETY_SCORES_TABLE}")
+except Exception as e:
+    logger.warning(f"⚠️  Failed to initialize DynamoDB safety scores table: {e}")
+    safety_table = None
+
+# Initialize Bedrock recommender
+recommender = BedrockRouteRecommender()
+
+
+class RealtimeDataFetcher:
+    """Fetch real-time train data from DynamoDB"""
+
+    @staticmethod
+    def get_next_arrivals(station_name: str, limit: int = 5) -> Dict:
+        """
+        Get next train arrivals for a station from real-time DynamoDB table
+        Queries smartroute_station_realtime_state for current vehicle positions
+        """
+        if not realtime_table:
+            logger.warning(f"❌ Realtime table not available")
+            return {"status": "unavailable", "arrivals": []}
+
+        try:
+            # Query for station state - Phase 1 populates this every minute
+            response = realtime_table.query(
+                KeyConditionExpression='station_id = :sid',
+                ExpressionAttributeValues={':sid': station_name},
+                ScanIndexForward=False,  # Most recent first
+                Limit=limit
+            )
+
+            items = response.get('Items', [])
+
+            if items:
+                logger.info(f"✅ Found {len(items)} real-time entries for {station_name}")
+                arrivals = []
+
+                for item in items:
+                    arrivals.append({
+                        "line": item.get('line', 'Unknown'),
+                        "destination": item.get('destination', 'Unknown'),
+                        "eta_seconds": item.get('eta_seconds', 0),
+                        "eta_minutes": int(item.get('eta_seconds', 0) / 60),
+                        "delay_seconds": item.get('delay_seconds', 0),
+                        "timestamp": item.get('timestamp', '')
+                    })
+
+                return {
+                    "status": "live",
+                    "station": station_name,
+                    "arrivals": arrivals
+                }
+            else:
+                logger.info(f"⚠️  No real-time data for {station_name} - using static schedules")
+                return {"status": "no_data", "arrivals": []}
+
+        except Exception as e:
+            logger.error(f"❌ Error fetching real-time data: {e}")
+            return {"status": "error", "arrivals": []}
+
+
+class DynamoDBSafetyFetcher:
+    """Fetch pre-computed safety scores from DynamoDB cache (Phase 5)"""
+
+    @staticmethod
+    def _extract_primary_name(station_name: str) -> str:
+        """
+        Extract primary station name from full qualified name.
+        E.g., "Times Square-42nd Street" → "Times Square"
+        """
+        # If hyphen exists, take the first part (primary name)
+        if '-' in station_name:
+            return station_name.split('-')[0].strip()
+        return station_name
+
+    @staticmethod
+    def get_safety_data(station_name: str) -> Optional[Dict]:
+        """
+        Get pre-computed safety scores from SmartRoute_Safety_Scores DynamoDB table
+
+        Args:
+            station_name: Name of the station (full or abbreviated)
+
+        Returns:
+            Dict with safety_score, incident_count, median_safety if found, None otherwise
+        """
+        if not safety_table:
+            logger.warning(f"❌ Safety scores table not available")
+            return None
+
+        try:
+            # Try exact match first
+            response = safety_table.get_item(
+                Key={'station_name': station_name}
+            )
+
+            # If no exact match, try primary station name
+            if 'Item' not in response:
+                primary_name = DynamoDBSafetyFetcher._extract_primary_name(station_name)
+                if primary_name != station_name:
+                    logger.info(f"   Trying primary name: {primary_name}")
+                    response = safety_table.get_item(
+                        Key={'station_name': primary_name}
+                    )
+
+            if 'Item' in response:
+                item = response['Item']
+                logger.info(f"✅ Found cached safety data for {station_name}")
+
+                # Convert DynamoDB Decimal to float
+                from decimal import Decimal
+                safety_score = float(item.get('safety_score', Decimal('5.0')))
+                incident_count = int(item.get('incident_count', 0))
+                median_safety = float(item.get('median_safety', Decimal('5.0')))
+
+                return {
+                    "station_name": station_name,
+                    "incident_count": incident_count,
+                    "median_safety_score": median_safety,
+                    "safety_score": safety_score,
+                    "updated_at": item.get('updated_at', 'Unknown'),
+                    "source": "dynamodb_cache"
+                }
+            else:
+                logger.info(f"⚠️  No cached safety data for {station_name}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Error fetching from DynamoDB: {e}")
+            return None
+
+
+class AthenaDataFetcher:
+    """Fetch crime/safety data from Athena (fallback if DynamoDB unavailable)"""
+
+    def __init__(self):
+        self.database = ATHENA_DATABASE
+        self.output_location = ATHENA_OUTPUT_LOCATION
+
+    def get_crime_data(self, station_name: str, days: int = 7) -> Dict:
+        """Query Athena for crime incidents near a station"""
+        try:
+            query = f"""
+            SELECT
+                station_name,
+                COUNT(*) as incident_count,
+                APPROX_PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY safety_score) as median_safety
+            FROM {self.database}.crime_by_station
+            WHERE station_name = '{station_name}'
+              AND incident_date >= CAST(CURRENT_DATE - INTERVAL '1' DAY * {days} AS VARCHAR)
+            GROUP BY station_name
+            """
+
+            logger.info(f"📍 Querying Athena for crime data: {station_name}")
+            query_id = self._execute_query(query)
+            result = self._get_query_results(query_id)
+
+            if result and len(result) > 1:
+                row = result[1]
+                return {
+                    "station_name": row[0],
+                    "incident_count": int(row[1]) if row[1] else 0,
+                    "median_safety_score": float(row[2]) if row[2] else 5.0
+                }
+            else:
+                return {
+                    "station_name": station_name,
+                    "incident_count": 0,
+                    "median_safety_score": 5.0
+                }
+
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch crime data: {e}")
+            return {
+                "station_name": station_name,
+                "incident_count": 0,
+                "median_safety_score": 5.0
+            }
+
+    def _execute_query(self, query: str) -> str:
+        """Execute Athena query"""
+        try:
+            response = athena_client.start_query_execution(
+                QueryString=query,
+                QueryExecutionContext={'Database': self.database},
+                ResultConfiguration={'OutputLocation': self.output_location}
+            )
+            return response['QueryExecutionId']
+        except Exception as e:
+            logger.error(f"Failed to execute Athena query: {e}")
+            raise
+
+    def _get_query_results(self, query_id: str, max_retries: int = 10) -> Optional[list]:
+        """Get query results with polling"""
+        import time
+
+        for attempt in range(max_retries):
+            try:
+                response = athena_client.get_query_execution(QueryExecutionId=query_id)
+                status = response['QueryExecution']['Status']['State']
+
+                if status == 'SUCCEEDED':
+                    results_response = athena_client.get_query_results(
+                        QueryExecutionId=query_id,
+                        MaxResults=10
+                    )
+                    rows = []
+                    for row in results_response['ResultSet']['Rows']:
+                        rows.append([field.get('VarCharValue', '') for field in row['Data']])
+                    return rows
+
+                elif status in ['FAILED', 'CANCELLED']:
+                    logger.error(f"Query {query_id} {status}")
+                    return None
+
+                time.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"Error polling query: {e}")
+                return None
+
+        logger.error(f"Query timeout after {max_retries} attempts")
+        return None
+
+
+def generate_cache_key(origin: str, destination: str, criterion: str) -> str:
+    """Generate cache key from route parameters"""
+    key_string = f"{origin}|{destination}|{criterion}".lower()
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+
+def get_from_cache(cache_key: str) -> Optional[Dict]:
+    """Retrieve cached route recommendation"""
+    if not cache_table:
+        return None
+
+    try:
+        response = cache_table.get_item(Key={'cache_key': cache_key})
+
+        if 'Item' in response:
+            item = response['Item']
+            if 'expiry' in item:
+                if datetime.fromtimestamp(float(item['expiry'])) > datetime.utcnow():
+                    logger.info(f"✅ Cache hit: {cache_key[:8]}...")
+                    return item['data']
+
+        return None
+
+    except Exception as e:
+        logger.warning(f"Error retrieving from cache: {e}")
+        return None
+
+
+def put_in_cache(cache_key: str, data: Dict) -> bool:
+    """Store route recommendation in cache"""
+    if not cache_table:
+        return False
+
+    try:
+        expiry = datetime.utcnow() + timedelta(seconds=CACHE_TTL_SECONDS)
+        cache_table.put_item(
+            Item={
+                'cache_key': cache_key,
+                'data': data,
+                'expiry': int(expiry.timestamp()),
+                'created_at': datetime.utcnow().isoformat()
+            }
+        )
+        logger.info(f"✅ Cached result: {cache_key[:8]}...")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error storing in cache: {e}")
+        return False
+
+
+def validate_request(event: Dict) -> Tuple[bool, Optional[str], Dict]:
+    """Validate request parameters"""
+    try:
+        body = event.get('body', {})
+        if isinstance(body, str):
+            body = json.loads(body)
+
+        origin_address = body.get('origin_address', '').strip()
+        destination_address = body.get('destination_address', '').strip()
+        criterion = body.get('criterion', 'balanced').lower()
+
+        if not origin_address or not destination_address:
+            return False, "Missing origin or destination address", {}
+
+        if criterion not in ['safe', 'fast', 'balanced']:
+            criterion = 'balanced'
+
+        return True, None, {
+            'origin_address': origin_address,
+            'destination_address': destination_address,
+            'criterion': criterion
+        }
+
+    except Exception as e:
+        logger.error(f"Error validating request: {e}")
+        return False, f"Invalid request: {str(e)}", {}
+
+
+def error_response(status_code: int, message: str) -> Dict:
+    """Format error response"""
+    return {
+        'statusCode': status_code,
+        'headers': {'Content-Type': 'application/json'},
+        'body': json.dumps({
+            'error': message,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    }
+
+
+def success_response(data: Dict) -> Dict:
+    """Format success response"""
+    return {
+        'statusCode': 200,
+        'headers': {'Content-Type': 'application/json'},
+        'body': json.dumps(data)
+    }
+
+
+def resolve_station(address_or_station: str) -> Tuple[Optional[str], float]:
+    """
+    Resolve input to a station name.
+    Tries direct station name lookup (exact and partial matches).
+    Returns (station_name, distance_km)
+    """
+    # Try direct station name match first (case-insensitive)
+    for station_name in NYC_STATIONS.keys():
+        if station_name.lower() == address_or_station.lower():
+            logger.info(f"✅ Found exact station match: {station_name}")
+            return station_name, 0.0
+
+    # Try partial match (e.g., "times square" matches "Times Square-42nd Street")
+    normalized_input = address_or_station.lower()
+    for station_name in NYC_STATIONS.keys():
+        if normalized_input in station_name.lower() or station_name.lower().split('-')[0].lower() in normalized_input:
+            logger.info(f"✅ Found partial station match: {station_name}")
+            return station_name, 0.0
+
+    logger.error(f"❌ Station not found: {address_or_station}")
+    return None, 0.0
+
+
+def lambda_handler(event, context):
+    """
+    Lambda entry point for route recommendation
+
+    Expected request body:
+    {
+        "origin_address": "Times Square" or "123 Main St, NYC",
+        "destination_address": "Brooklyn Bridge" or "456 Park Ave, NYC",
+        "criterion": "balanced"  # safe, fast, or balanced
+    }
+
+    Supports both station names and addresses
+    """
+    logger.info(f"📍 Route recommendation request received")
+
+    # Validate request
+    is_valid, error, params = validate_request(event)
+    if not is_valid:
+        logger.error(f"❌ Validation failed: {error}")
+        return error_response(400, error)
+
+    origin_address = params['origin_address']
+    destination_address = params['destination_address']
+    criterion = params['criterion']
+
+    logger.info(f"   Origin: {origin_address}")
+    logger.info(f"   Destination: {destination_address}")
+    logger.info(f"   Criterion: {criterion}")
+
+    # Step 1: Resolve addresses/stations to actual station names
+    logger.info(f"📍 Resolving origin and destination...")
+    origin_station, origin_distance = resolve_station(origin_address)
+    dest_station, dest_distance = resolve_station(destination_address)
+
+    if not origin_station or not dest_station:
+        return error_response(400, "Could not resolve one or both addresses to subway stations")
+
+    logger.info(f"   Origin: {origin_station} ({origin_distance:.2f} km away)")
+    logger.info(f"   Destination: {dest_station} ({dest_distance:.2f} km away)")
+
+    # Step 2: Generate cache key
+    cache_key = generate_cache_key(origin_station, dest_station, criterion)
+
+    # Step 3: Check cache
+    cached_result = get_from_cache(cache_key)
+    if cached_result:
+        logger.info(f"✅ Returning cached recommendation")
+        return success_response(cached_result)
+
+    # Step 4: Fetch real-time train data
+    logger.info(f"⏱️  Fetching real-time train data...")
+    realtime_fetcher = RealtimeDataFetcher()
+    origin_trains = realtime_fetcher.get_next_arrivals(origin_station, limit=3)
+    dest_trains = realtime_fetcher.get_next_arrivals(dest_station, limit=3)
+
+    logger.info(f"   Origin trains: {len(origin_trains.get('arrivals', []))} upcoming")
+    logger.info(f"   Destination trains: {len(dest_trains.get('arrivals', []))} upcoming")
+
+    # Step 5: Fetch safety data (Phase 5: DynamoDB cache with Athena fallback)
+    logger.info(f"📊 Fetching safety data...")
+
+    # Try DynamoDB first (fast, pre-computed)
+    origin_crime = DynamoDBSafetyFetcher.get_safety_data(origin_station)
+    dest_crime = DynamoDBSafetyFetcher.get_safety_data(dest_station)
+
+    # Fallback to Athena if DynamoDB unavailable
+    athena_fetcher = AthenaDataFetcher()
+
+    if not origin_crime:
+        logger.info(f"   Falling back to Athena for {origin_station}")
+        try:
+            athena_result = athena_fetcher.get_crime_data(origin_station)
+            origin_crime = {**athena_result, "source": "athena"}
+        except Exception as e:
+            logger.warning(f"⚠️  Error fetching from Athena: {e}")
+            origin_crime = {"station_name": origin_station, "incident_count": 0, "median_safety_score": 5.0, "source": "default"}
+
+    if not dest_crime:
+        logger.info(f"   Falling back to Athena for {dest_station}")
+        try:
+            athena_result = athena_fetcher.get_crime_data(dest_station)
+            dest_crime = {**athena_result, "source": "athena"}
+        except Exception as e:
+            logger.warning(f"⚠️  Error fetching from Athena: {e}")
+            dest_crime = {"station_name": dest_station, "incident_count": 0, "median_safety_score": 5.0, "source": "default"}
+
+    logger.info(f"   {origin_station}: {origin_crime['incident_count']} incidents ({origin_crime.get('source', 'unknown')})")
+    logger.info(f"   {dest_station}: {dest_crime['incident_count']} incidents ({dest_crime.get('source', 'unknown')})")
+
+    # Step 6: Build context for Bedrock
+    context = {
+        "crime_incidents": {
+            origin_station: origin_crime['incident_count'],
+            dest_station: dest_crime['incident_count']
+        },
+        "safety_scores": {
+            origin_station: origin_crime['median_safety_score'],
+            dest_station: dest_crime['median_safety_score']
+        },
+        "real_time_data": {
+            origin_station: origin_trains,
+            dest_station: dest_trains
+        },
+        "walking_distances": {
+            "origin_km": origin_distance,
+            "destination_km": dest_distance
+        }
+    }
+
+    # Step 7: Get route recommendations from Bedrock
+    logger.info(f"🤖 Requesting route recommendations from Bedrock...")
+    try:
+        result = recommender.get_route_recommendations(
+            origin=origin_station,
+            destination=dest_station,
+            context=context
+        )
+
+        logger.info(f"✅ Routes generated successfully")
+
+        # Add metadata
+        response_data = {
+            **result,
+            "origin_address": origin_address,
+            "destination_address": destination_address,
+            "origin_station": origin_station,
+            "destination_station": dest_station,
+            "criterion": criterion,
+            "walking_distances": context["walking_distances"],
+            "requested_at": datetime.utcnow().isoformat(),
+            "cached": False
+        }
+
+        # Cache the result
+        put_in_cache(cache_key, response_data)
+
+        return success_response(response_data)
+
+    except Exception as e:
+        logger.error(f"❌ Bedrock recommendation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return error_response(500, f"Failed to generate routes: {str(e)}")
+
+
+# Local testing
+if __name__ == "__main__":
+    test_event = {
+        'body': json.dumps({
+            'origin_address': '123 Main St, Times Square, NYC',
+            'destination_address': '456 Park Ave, Brooklyn Bridge, NYC',
+            'criterion': 'balanced'
+        })
+    }
+
+    response = lambda_handler(test_event, None)
+    print(json.dumps(response, indent=2))
