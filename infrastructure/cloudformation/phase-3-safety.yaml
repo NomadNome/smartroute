@@ -1,7 +1,17 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'SmartRoute Phase 3 - Safety Intelligence with Crime & 311 Data'
+Description: 'Phase 3: SmartRoute Safety Intelligence with Crime & 311 Data'
 
 Parameters:
+  ProjectName:
+    Type: String
+    Default: smartroute
+    Description: Project name for resource naming
+
+  Environment:
+    Type: String
+    Default: development
+    Description: Environment (development/staging/production)
+
   DataLakeBucket:
     Type: String
     Default: smartroute-data-lake-069899605581
@@ -9,10 +19,11 @@ Parameters:
 
 Resources:
   # ===== IAM Roles =====
-  
+
   CrimePollerLambdaRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${ProjectName}-crime-poller-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -38,11 +49,12 @@ Resources:
               - Effect: Allow
                 Action:
                   - glue:StartJobRun
-                Resource: '*'
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-*'
 
   ComplaintsPollerLambdaRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${ProjectName}-complaints-poller-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -68,11 +80,12 @@ Resources:
               - Effect: Allow
                 Action:
                   - glue:StartJobRun
-                Resource: '*'
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-*'
 
   SafetyEnrichmentLambdaRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${ProjectName}-safety-enrichment-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -102,6 +115,7 @@ Resources:
   GlueJobRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${ProjectName}-phase3-glue-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -133,7 +147,10 @@ Resources:
               - Effect: Allow
                 Action:
                   - glue:*
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${ProjectName}*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}*'
         - PolicyName: LogsAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -150,7 +167,7 @@ Resources:
   CrimePollerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: smartroute-crime-poller
+      FunctionName: !Sub '${ProjectName}-crime-poller'
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt CrimePollerLambdaRole.Arn
@@ -165,11 +182,18 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DataLakeBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '3'
 
   ComplaintsPollerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: smartroute-complaints-311-poller
+      FunctionName: !Sub '${ProjectName}-complaints-311-poller'
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt ComplaintsPollerLambdaRole.Arn
@@ -184,11 +208,18 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DataLakeBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '3'
 
   SafetyEnrichmentFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: smartroute-safety-enrichment
+      FunctionName: !Sub '${ProjectName}-safety-enrichment'
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt SafetyEnrichmentLambdaRole.Arn
@@ -203,13 +234,20 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DataLakeBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '3'
 
   # ===== EventBridge Rules =====
 
   CrimePollerScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: smartroute-crime-poller-daily
+      Name: !Sub '${ProjectName}-crime-poller-daily'
       Description: Trigger crime poller daily at 2 AM UTC
       ScheduleExpression: 'cron(0 2 * * ? *)'
       State: ENABLED
@@ -221,7 +259,7 @@ Resources:
   ComplaintsPollerScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: smartroute-complaints-311-poller-6h
+      Name: !Sub '${ProjectName}-complaints-311-poller-6h'
       Description: Trigger 311 poller every 6 hours
       ScheduleExpression: 'rate(6 hours)'
       State: ENABLED
@@ -233,7 +271,7 @@ Resources:
   SafetyEnrichmentScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: smartroute-safety-enrichment-hourly
+      Name: !Sub '${ProjectName}-safety-enrichment-hourly'
       Description: Trigger safety enrichment hourly
       ScheduleExpression: 'rate(1 hour)'
       State: ENABLED
@@ -270,6 +308,7 @@ Resources:
   EventBridgeRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${ProjectName}-phase3-eventbridge-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -295,7 +334,7 @@ Resources:
   CrimeNormalizationJob:
     Type: AWS::Glue::Job
     Properties:
-      Name: smartroute-crime-normalization
+      Name: !Sub '${ProjectName}-crime-normalization'
       Role: !GetAtt GlueJobRole.Arn
       Command:
         Name: glueetl
@@ -312,7 +351,7 @@ Resources:
   ComplaintsNormalizationJob:
     Type: AWS::Glue::Job
     Properties:
-      Name: smartroute-311-normalization
+      Name: !Sub '${ProjectName}-311-normalization'
       Role: !GetAtt GlueJobRole.Arn
       Command:
         Name: glueetl
@@ -331,7 +370,7 @@ Resources:
   CrimePollerErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: smartroute-crime-poller-errors
+      AlarmName: !Sub '${ProjectName}-crime-poller-errors'
       MetricName: Errors
       Namespace: AWS/Lambda
       Statistic: Sum
@@ -346,7 +385,7 @@ Resources:
   ComplaintsPollerErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: smartroute-complaints-311-poller-errors
+      AlarmName: !Sub '${ProjectName}-complaints-311-poller-errors'
       MetricName: Errors
       Namespace: AWS/Lambda
       Statistic: Sum
@@ -358,33 +397,53 @@ Resources:
         - Name: FunctionName
           Value: !Ref ComplaintsPollerFunction
 
+  # ===== Log Groups =====
+
+  CrimePollerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-crime-poller'
+      RetentionInDays: 14
+
+  ComplaintsPollerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-complaints-311-poller'
+      RetentionInDays: 14
+
+  SafetyEnrichmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-safety-enrichment'
+      RetentionInDays: 14
+
 Outputs:
   CrimePollerFunctionArn:
     Description: Crime Poller Lambda ARN
     Value: !GetAtt CrimePollerFunction.Arn
     Export:
-      Name: !Sub '${AWS::StackName}-CrimePollerArn'
+      Name: !Sub '${ProjectName}-crime-poller-arn'
 
   ComplaintsPollerFunctionArn:
     Description: Complaints 311 Poller Lambda ARN
     Value: !GetAtt ComplaintsPollerFunction.Arn
     Export:
-      Name: !Sub '${AWS::StackName}-ComplaintsPollerArn'
+      Name: !Sub '${ProjectName}-complaints-poller-arn'
 
   SafetyEnrichmentFunctionArn:
     Description: Safety Enrichment Lambda ARN
     Value: !GetAtt SafetyEnrichmentFunction.Arn
     Export:
-      Name: !Sub '${AWS::StackName}-SafetyEnrichmentArn'
+      Name: !Sub '${ProjectName}-safety-enrichment-arn'
 
   CrimeNormalizationJobName:
     Description: Crime Normalization Glue Job
     Value: !Ref CrimeNormalizationJob
     Export:
-      Name: !Sub '${AWS::StackName}-CrimeNormalizationJob'
+      Name: !Sub '${ProjectName}-crime-normalization-job'
 
   ComplaintsNormalizationJobName:
     Description: 311 Normalization Glue Job
     Value: !Ref ComplaintsNormalizationJob
     Export:
-      Name: !Sub '${AWS::StackName}-ComplaintsNormalizationJob'
+      Name: !Sub '${ProjectName}-complaints-normalization-job'

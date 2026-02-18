@@ -76,6 +76,10 @@ npm-debug.log*
 **/*private*
 !infrastructure/
 
+# Vendored Lambda packages
+lambdas/*/package/
+lambdas/*/*.zip
+
 # Build artifacts
 *.zip
 build/

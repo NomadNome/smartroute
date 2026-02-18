@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Phase 4: SmartRoute Intelligence Layer - Bedrock Router, API Gateway'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: smartroute
+    Description: Project name for resource naming
+
+  Environment:
+    Type: String
+    Default: development
+    Description: Environment (development/staging/production)
+
+  DataLakeBucket:
+    Type: String
+    Default: smartroute-data-lake-069899605581
+    Description: S3 bucket for data lake
+
+Resources:
+  # ==================== IAM Role ====================
+
+  BedrockRouterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-router-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*'
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataLakeBucket}'
+                  - !Sub 'arn:aws:s3:::${DataLakeBucket}/*'
+        - PolicyName: DynamoDBReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}_cached_routes'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}_station_realtime_state'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '4'
+
+  # ==================== Lambda Function ====================
+
+  BedrockRouterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-bedrock-router'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockRouterRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code during deployment
+          import json
+          import boto3
+
+          bedrock = boto3.client('bedrock-runtime')
+
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                  'body': json.dumps({'message': 'Bedrock router placeholder'})
+              }
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          DATA_LAKE_BUCKET: !Ref DataLakeBucket
+          BEDROCK_MODEL_ID: anthropic.claude-3-haiku-20240307-v1:0
+          CACHED_ROUTES_TABLE: !Sub '${ProjectName}_cached_routes'
+          STATION_STATE_TABLE: !Sub '${ProjectName}_station_realtime_state'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Phase
+          Value: '4'
+
+  # ==================== API Gateway ====================
+
+  BedrockRouterApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-intelligence-api'
+      Description: SmartRoute Intelligence API powered by Bedrock
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  BedrockRouterApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BedrockRouterApi
+      ParentId: !GetAtt BedrockRouterApi.RootResourceId
+      PathPart: route
+
+  BedrockRouterApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BedrockRouterApi
+      ResourceId: !Ref BedrockRouterApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BedrockRouterFunction.Arn}/invocations'
+
+  BedrockRouterApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: BedrockRouterApiMethod
+    Properties:
+      RestApiId: !Ref BedrockRouterApi
+
+  BedrockRouterApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref BedrockRouterApi
+      DeploymentId: !Ref BedrockRouterApiDeployment
+      StageName: !Ref Environment
+
+  # ==================== Lambda Permission for API Gateway ====================
+
+  BedrockRouterApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockRouterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BedrockRouterApi}/*'
+
+  # ==================== CloudWatch Log Group ====================
+
+  BedrockRouterLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-bedrock-router'
+      RetentionInDays: 14
+
+  # ==================== CloudWatch Alarms ====================
+
+  BedrockRouterErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-bedrock-router-errors'
+      AlarmDescription: Alert on Bedrock router Lambda errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BedrockRouterFunction
+      TreatMissingData: notBreaching
+
+  BedrockRouterDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-bedrock-router-duration'
+      AlarmDescription: Alert if Bedrock router takes too long
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BedrockRouterFunction
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-errors'
+      AlarmDescription: Alert on API Gateway 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-intelligence-api'
+
+Outputs:
+  BedrockRouterFunctionArn:
+    Description: Bedrock Router Lambda ARN
+    Value: !GetAtt BedrockRouterFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-bedrock-router-arn'
+
+  BedrockRouterFunctionName:
+    Description: Bedrock Router Lambda Name
+    Value: !Ref BedrockRouterFunction
+    Export:
+      Name: !Sub '${ProjectName}-bedrock-router-name'
+
+  ApiGatewayUrl:
+    Description: API Gateway URL
+    Value: !Sub 'https://${BedrockRouterApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-url'
+
+  ApiGatewayId:
+    Description: API Gateway ID
+    Value: !Ref BedrockRouterApi
+    Export:
+      Name: !Sub '${ProjectName}-api-id'

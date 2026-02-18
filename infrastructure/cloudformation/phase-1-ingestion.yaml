@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Phase 1: SmartRoute Real-Time Data Ingestion - Lambda, Kinesis, EventBridge'
+Description: 'Phase 1: SmartRoute Real-Time Data Ingestion - Lambda, SQS, EventBridge'
 
 Parameters:
   ProjectName:
@@ -17,10 +17,15 @@ Parameters:
     Default: 512
     Description: Lambda function memory in MB
 
-  KinesisShards:
+  SQSVisibilityTimeout:
     Type: Number
-    Default: 1
-    Description: Number of Kinesis shards
+    Default: 120
+    Description: SQS visibility timeout in seconds
+
+  SQSMessageRetentionPeriod:
+    Type: Number
+    Default: 345600
+    Description: SQS message retention period in seconds (default 4 days)
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -31,18 +36,32 @@ Metadata:
           - ProjectName
           - Environment
           - LambdaMemory
-          - KinesisShards
+          - SQSVisibilityTimeout
+          - SQSMessageRetentionPeriod
 
 Resources:
-  # ==================== Kinesis Stream ====================
+  # ==================== SQS Queues ====================
 
-  TransitDataStream:
-    Type: AWS::Kinesis::Stream
+  TransitDataDLQ:
+    Type: AWS::SQS::Queue
     Properties:
-      Name: !Sub '${ProjectName}_transit_data_stream'
-      ShardCount: !Ref KinesisShards
-      StreamModeDetails:
-        StreamMode: PROVISIONED
+      QueueName: !Sub '${ProjectName}-transit-data-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  TransitDataQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-transit-data-queue'
+      VisibilityTimeout: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !Ref SQSMessageRetentionPeriod
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TransitDataDLQ.Arn
+        maxReceiveCount: 3
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -71,7 +90,7 @@ Resources:
           PROJECT_NAME: !Ref ProjectName
           ENVIRONMENT: !Ref Environment
           S3_BUCKET: !Sub '${ProjectName}-data-lake-${AWS::AccountId}'
-          KINESIS_STREAM_NAME: !GetAtt TransitDataStream.Arn
+          SQS_QUEUE_URL: !Ref TransitDataQueue
           DYNAMODB_TABLE: !Sub '${ProjectName}_station_realtime_state'
           LOG_LEVEL: INFO
       Tags:
@@ -106,20 +125,16 @@ Resources:
         - Key: Phase
           Value: '1'
 
-  # ==================== Event Source Mapping (Kinesis → Lambda) ====================
+  # ==================== Event Source Mapping (SQS → Lambda) ====================
 
   RealtimeProcessorEventSource:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      EventSourceArn: !GetAtt TransitDataStream.Arn
+      EventSourceArn: !GetAtt TransitDataQueue.Arn
       FunctionName: !GetAtt RealtimeProcessorFunction.Arn
       Enabled: true
-      BatchSize: 100
-      StartingPosition: LATEST
+      BatchSize: 10
       MaximumBatchingWindowInSeconds: 5
-      ParallelizationFactor: 10
-      MaximumRetryAttempts: 2
-      BisectBatchOnFunctionError: true
 
   # ==================== EventBridge Rules ====================
 
@@ -184,22 +199,22 @@ Resources:
         - Name: FunctionName
           Value: !Ref MtaPollerFunction
 
-  KinesisIteratorAgeAlarm:
+  SQSApproximateAgeAlarm:
     Type: AWS::CloudWatch::Alarm
-    DependsOn: TransitDataStream
+    DependsOn: TransitDataQueue
     Properties:
-      AlarmName: !Sub '${ProjectName}-kinesis-iterator-age'
-      AlarmDescription: Alert if Kinesis iterator age is too high
-      MetricName: GetRecords.IteratorAgeMilliseconds
-      Namespace: AWS/Kinesis
+      AlarmName: !Sub '${ProjectName}-sqs-message-age'
+      AlarmDescription: Alert if SQS message age is too high
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
       Statistic: Maximum
       Period: 300
       EvaluationPeriods: 1
-      Threshold: 60000
+      Threshold: 60
       ComparisonOperator: GreaterThanThreshold
       Dimensions:
-        - Name: StreamName
-          Value: !Ref TransitDataStream
+        - Name: QueueName
+          Value: !GetAtt TransitDataQueue.QueueName
 
   # ==================== CloudWatch Dashboards ====================
 
@@ -207,23 +222,23 @@ Resources:
     Type: AWS::CloudWatch::Dashboard
     DependsOn:
       - MtaPollerFunction
-      - TransitDataStream
+      - TransitDataQueue
     Properties:
       DashboardName: !Sub '${ProjectName}-phase1-monitoring'
-      DashboardBody: |
+      DashboardBody: !Sub |
         {
           "widgets": [
             {
               "type": "metric",
               "properties": {
                 "metrics": [
-                  [ "AWS/Lambda", "Invocations", { "stat": "Sum" } ],
-                  [ ".", "Errors", { "stat": "Sum" } ],
-                  [ ".", "Duration", { "stat": "Average" } ]
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${MtaPollerFunction}", { "stat": "Sum" } ],
+                  [ ".", "Errors", "FunctionName", "${MtaPollerFunction}", { "stat": "Sum" } ],
+                  [ ".", "Duration", "FunctionName", "${MtaPollerFunction}", { "stat": "Average" } ]
                 ],
                 "period": 60,
                 "stat": "Average",
-                "region": "us-east-1",
+                "region": "${AWS::Region}",
                 "title": "MTA Poller Lambda Metrics"
               }
             },
@@ -231,13 +246,14 @@ Resources:
               "type": "metric",
               "properties": {
                 "metrics": [
-                  [ "AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", { "stat": "Maximum" } ],
-                  [ ".", "GetRecords.Records", { "stat": "Sum" } ]
+                  [ "AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${TransitDataQueue.QueueName}", { "stat": "Maximum" } ],
+                  [ ".", "ApproximateNumberOfMessagesVisible", "QueueName", "${TransitDataQueue.QueueName}", { "stat": "Sum" } ],
+                  [ ".", "NumberOfMessagesSent", "QueueName", "${TransitDataQueue.QueueName}", { "stat": "Sum" } ]
                 ],
                 "period": 60,
                 "stat": "Average",
-                "region": "us-east-1",
-                "title": "Kinesis Stream Metrics"
+                "region": "${AWS::Region}",
+                "title": "SQS Queue Metrics"
               }
             }
           ]
@@ -258,17 +274,23 @@ Resources:
       RetentionInDays: 14
 
 Outputs:
-  TransitDataStreamArn:
-    Description: Kinesis Stream ARN
-    Value: !GetAtt TransitDataStream.Arn
+  TransitDataQueueArn:
+    Description: SQS Queue ARN
+    Value: !GetAtt TransitDataQueue.Arn
     Export:
-      Name: !Sub '${ProjectName}-kinesis-stream-arn'
+      Name: !Sub '${ProjectName}-sqs-queue-arn'
 
-  TransitDataStreamName:
-    Description: Kinesis Stream Name
-    Value: !Ref TransitDataStream
+  TransitDataQueueUrl:
+    Description: SQS Queue URL
+    Value: !Ref TransitDataQueue
     Export:
-      Name: !Sub '${ProjectName}-kinesis-stream-name'
+      Name: !Sub '${ProjectName}-sqs-queue-url'
+
+  TransitDataDLQArn:
+    Description: SQS Dead Letter Queue ARN
+    Value: !GetAtt TransitDataDLQ.Arn
+    Export:
+      Name: !Sub '${ProjectName}-sqs-dlq-arn'
 
   MtaPollerFunctionArn:
     Description: MTA Poller Lambda ARN
